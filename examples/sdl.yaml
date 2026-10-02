@@ -1,0 +1,66 @@
+# Example SDL configuration: roll over root passwords on Linux VMs and keep
+# them in HashiCorp Vault. Validate with: sdl check-config -c sdl.yaml
+
+modules:
+  # Every system and user action is appended here, hash-chained so tampering shows.
+  audit:
+    type: audit.jsonl
+    config:
+      path: /var/lib/sdl/audit.jsonl
+
+  # API clients. Create entries with: sdl token new --id <name> --role operator
+  auth:
+    type: auth.static_token
+    config:
+      clients:
+        - id: admin
+          display_name: SDL administrator
+          # Placeholder; replace with the hash printed by `sdl token new`.
+          token_sha256: "0000000000000000000000000000000000000000000000000000000000000000"
+          roles: [admin]
+
+  passwords:
+    type: generator.password
+    config:
+      length: 32
+
+  vault:
+    type: secrets.vault
+    config:
+      url: https://vault.example.com:8200
+      mount: secret          # KV v2 mount
+      path_prefix: sdl       # secrets land at secret/data/sdl/<secret_path>
+      auth_method: token     # or approle (role_id + VAULT_SECRET_ID env var)
+      token_env: VAULT_TOKEN
+
+  linux:
+    type: target.ssh_linux
+    config:
+      username: sdl-svc
+      private_key_path: /etc/sdl/ssh/id_ed25519
+      known_hosts_path: /etc/sdl/ssh/known_hosts
+      verify_method: su      # or ssh_login
+
+targets:
+  - name: web1
+    host: 10.0.0.11
+    module: linux
+    account: root
+    secret_path: linux/web1/root
+    groups: [web]
+  - name: web2
+    host: 10.0.0.12
+    module: linux
+    account: root
+    secret_path: linux/web2/root
+    groups: [web]
+  - name: db1
+    host: 10.0.0.21
+    port: 2222
+    module: linux
+    account: root
+    secret_path: linux/db1/root
+    groups: [db]
+
+rollover:
+  max_parallel: 5
