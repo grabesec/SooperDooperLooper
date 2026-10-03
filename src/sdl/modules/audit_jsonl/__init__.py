@@ -11,12 +11,13 @@ import hashlib
 import json
 import os
 from collections import deque
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
 from pydantic import Field
 
-from sdl.core.models import AuditEvent
+from sdl.core.models import AuditEvent, AuditFacets, AuditQuery
 from sdl.core.module import AuditModule, ModuleConfig
 
 GENESIS = "0" * 64
@@ -74,24 +75,34 @@ class JsonlAuditModule(AuditModule):
             if self.config.fsync:
                 os.fsync(fh.fileno())
 
-    def _read_all(self) -> list[AuditEvent]:
+    def _iter(self) -> Iterator[AuditEvent]:
         if not self.config.path.exists():
-            return []
+            return
         with self.config.path.open(encoding="utf-8") as fh:
-            return [AuditEvent.model_validate_json(line) for line in fh if line.strip()]
+            for line in fh:
+                if line.strip():
+                    yield AuditEvent.model_validate_json(line)
 
-    async def query(
-        self, *, run_id: str | None = None, target: str | None = None, limit: int = 100
-    ) -> list[AuditEvent]:
+    def _read_all(self) -> list[AuditEvent]:
+        return list(self._iter())
+
+    async def query(self, query: AuditQuery) -> list[AuditEvent]:
         def scan() -> list[AuditEvent]:
-            matches: deque[AuditEvent] = deque(maxlen=limit)
-            for event in self._read_all():
-                if run_id is not None and event.run_id != run_id:
-                    continue
-                if target is not None and event.target != target:
-                    continue
-                matches.append(event)
-            return list(matches)
+            matches: deque[AuditEvent] = deque(maxlen=query.limit)
+            for event in self._iter():
+                if query.matches(event):
+                    matches.append(event)
+            return list(reversed(matches)) if query.newest_first else list(matches)
+
+        async with self._lock:
+            return await asyncio.to_thread(scan)
+
+    async def facets(self) -> AuditFacets:
+        def scan() -> AuditFacets:
+            facets = AuditFacets()
+            for event in self._iter():
+                facets.add(event)
+            return facets
 
         async with self._lock:
             return await asyncio.to_thread(scan)

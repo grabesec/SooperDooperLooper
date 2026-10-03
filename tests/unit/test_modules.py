@@ -8,7 +8,7 @@ import pytest
 from pydantic import SecretStr, ValidationError
 
 from sdl.core.audit import AuditRecorder, AuditUnavailableError, redact
-from sdl.core.models import Outcome, TargetSpec
+from sdl.core.models import AuditQuery, Outcome, TargetSpec
 from sdl.core.module import ModuleContext
 from sdl.core.orchestrator import ConfigError, Orchestrator
 from sdl.core.registry import ModuleRegistry, UnknownModuleError
@@ -96,7 +96,7 @@ async def test_jsonl_audit_chain_detects_tampering(tmp_path: Path) -> None:
     recorder.attach([module2])
     await recorder.record("test.event", Outcome.INFO, message="after restart")
     assert (await module2.verify())[0]
-    assert len(await module2.query(limit=3)) == 3
+    assert len(await module2.query(AuditQuery(limit=3))) == 3
 
     lines = path.read_text().splitlines()
     edited = json.loads(lines[2])

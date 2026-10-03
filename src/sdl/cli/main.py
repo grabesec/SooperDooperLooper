@@ -8,6 +8,7 @@ import os
 import secrets
 import sys
 import time
+from datetime import date, datetime, timedelta
 from typing import Any
 from urllib.parse import quote as _quote
 
@@ -433,29 +434,132 @@ def cmd_systems_refresh(args: argparse.Namespace) -> int:
     return 0
 
 
+_RELATIVE = {"m": "minutes", "h": "hours", "d": "days", "w": "weeks"}
+
+
+def parse_time(text: str, *, end: bool = False) -> datetime:
+    """Turn ``2026-10-01``, ``2026-10-01T14:00``, ``24h``, ``7d``, ``today`` into a time.
+
+    Times without a zone are local. With ``end``, a bare date means the end of
+    that day, so ``--until 2026-10-01`` includes all of October 1st.
+    """
+    value = text.strip().lower()
+    now = datetime.now().astimezone()
+    if value == "now":
+        return now
+    if value in ("today", "yesterday"):
+        day = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        day -= timedelta(days=1 if value == "yesterday" else 0)
+        return day + timedelta(days=1) if end else day
+    if len(value) > 1 and value[-1] in _RELATIVE and value[:-1].isdigit():
+        return now - timedelta(**{_RELATIVE[value[-1]]: int(value[:-1])})
+    try:
+        if len(value) == 10:
+            day = datetime.combine(date.fromisoformat(value), datetime.min.time()).astimezone()
+            return day + timedelta(days=1) if end else day
+        parsed = datetime.fromisoformat(text.strip())
+    except ValueError as exc:
+        raise CliError(
+            f"not a time: {text!r} (use 2026-10-01, 2026-10-01T14:00, 24h, 7d or today)"
+        ) from exc
+    return parsed if parsed.tzinfo else parsed.astimezone()
+
+
+def audit_params(args: argparse.Namespace) -> list[tuple[str, str]]:
+    params: list[tuple[str, str]] = [("limit", str(args.limit))]
+    for key, values in (
+        ("target", args.target),
+        ("module", args.module),
+        ("action", args.action),
+        ("outcome", args.outcome),
+        ("actor", args.actor),
+    ):
+        params.extend((key, v) for v in values or [])
+    if args.run:
+        params.append(("run_id", args.run))
+    if args.since:
+        params.append(("since", parse_time(args.since).isoformat()))
+    if args.until:
+        params.append(("until", parse_time(args.until, end=True).isoformat()))
+    if args.search:
+        params.append(("q", args.search))
+    if args.newest_first:
+        params.append(("order", "newest"))
+    return params
+
+
+def print_events(events: list[dict[str, Any]], verbose: bool = False) -> None:
+    for e in events:
+        who = f"{e['actor']['type']}:{e['actor']['id']}"
+        if e.get("initiated_by"):
+            who += f" for {e['initiated_by']['id']}"
+        target = f" [{e['target']}]" if e.get("target") else ""
+        module = f" ({e['module']})" if e.get("module") else ""
+        message = f" — {e['message']}" if e.get("message") else ""
+        print(f"{e['ts']}  {e['outcome']:<8} {e['action']:<32}{target}{module} {who}{message}")
+        if verbose and e.get("details"):
+            print("    " + json.dumps(e["details"], sort_keys=True))
+
+
 def cmd_audit(args: argparse.Namespace) -> int:
     with client(args) as http:
         if args.verify:
             result = call(http, "GET", "/api/v1/audit/verify")
             print(("OK: " if result["ok"] else "TAMPERED: ") + result["detail"])
             return 0 if result["ok"] else 1
-        params = {"limit": args.limit}
-        if args.run:
-            params["run_id"] = args.run
-        if args.target:
-            params["target"] = args.target
-        events = call(http, "GET", "/api/v1/audit", params=params)
+        if args.facets:
+            facets = call(http, "GET", "/api/v1/audit/facets")
+        else:
+            events = call(http, "GET", "/api/v1/audit", params=audit_params(args))
+    if args.facets:
+        if args.json:
+            print(json.dumps(facets, indent=2))
+            return 0
+        print(f"{facets['events']} events, {facets['first'] or '-'} to {facets['last'] or '-'}")
+        for title, key in (
+            ("Systems", "targets"),
+            ("Modules", "modules"),
+            ("Actors", "actors"),
+            ("Actions", "actions"),
+        ):
+            print(f"\n{title}:")
+            for value, count in sorted(facets[key].items()):
+                print(f"  {value:<40} {count}")
+        return 0
     if args.json:
         print(json.dumps(events, indent=2))
-        return 0
-    for e in events:
-        who = f"{e['actor']['type']}:{e['actor']['id']}"
-        if e.get("initiated_by"):
-            who += f" for {e['initiated_by']['id']}"
-        target = f" [{e['target']}]" if e.get("target") else ""
-        message = f" — {e['message']}" if e.get("message") else ""
-        print(f"{e['ts']}  {e['outcome']:<8} {e['action']:<32}{target} {who}{message}")
+    elif events:
+        print_events(events, args.verbose)
+    else:
+        print("no events match", file=sys.stderr)
     return 0
+
+
+def cmd_forwarders(args: argparse.Namespace) -> int:
+    with client(args) as http:
+        forwarders = call(http, "GET", "/api/v1/forwarders")
+    if args.json:
+        print(json.dumps(forwarders, indent=2))
+        return 0
+    if not forwarders:
+        print("no forwarder modules are configured", file=sys.stderr)
+        return 0
+    rows: list[tuple[str, ...]] = [
+        ("FORWARDER", "STATE", "SENT", "QUEUED", "DROPPED", "LAST ERROR")
+    ]
+    for f in forwarders:
+        rows.append(
+            (
+                f["id"],
+                "ok" if f["ok"] else "RETRYING",
+                str(f["sent"]),
+                str(f["queued"]),
+                str(f["dropped"]),
+                f["last_error"] or "-",
+            )
+        )
+    print_table(rows)
+    return 0 if all(f["ok"] for f in forwarders) else 1
 
 
 # -- argument parsing -----------------------------------------------------------
@@ -573,13 +677,41 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--json", action="store_true")
     p.set_defaults(func=cmd_systems_list)
 
-    p = sub.add_parser("audit", help="read or verify the audit log")
-    p.add_argument("--run", help="only events of this run")
-    p.add_argument("--target", help="only events for this target")
-    p.add_argument("--limit", type=int, default=200)
+    p = sub.add_parser(
+        "audit",
+        aliases=["logs"],
+        help="review, filter or verify the audit log",
+        description="Show audit events; every filter given must match. "
+        "Repeat a filter to match any of several values.",
+    )
+    p.add_argument("-t", "--target", "--system", action="append", help="system (resource) name")
+    p.add_argument("-m", "--module", action="append", help="module instance id")
+    p.add_argument(
+        "-a",
+        "--action",
+        action="append",
+        help="action type; 'rollover' also matches 'rollover.target.change', '*' is a wildcard",
+    )
+    outcomes = ["started", "success", "failure", "info", "denied"]
+    p.add_argument("-o", "--outcome", action="append", choices=outcomes)
+    p.add_argument(
+        "-u", "--actor", "--user", action="append", help="user or component; includes on-behalf-of"
+    )
+    p.add_argument("--run", help="only events of this rollover run")
+    p.add_argument("--since", help="from: 2026-10-01, 2026-10-01T14:00, 24h, 7d, today")
+    p.add_argument("--until", help="to (a bare date includes that whole day)")
+    p.add_argument("-s", "--search", help="words to find in the message")
+    p.add_argument("--limit", type=int, default=200, help="most recent N matching events")
+    p.add_argument("--newest-first", action="store_true")
+    p.add_argument("-v", "--verbose", action="store_true", help="show each event's details")
+    p.add_argument("--facets", action="store_true", help="list the values present to filter by")
     p.add_argument("--verify", action="store_true", help="check the log's integrity")
     p.add_argument("--json", action="store_true")
     p.set_defaults(func=cmd_audit)
+
+    p = sub.add_parser("forwarders", help="show log forwarding status (syslog, Graylog, Splunk)")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(func=cmd_forwarders)
     return parser
 
 

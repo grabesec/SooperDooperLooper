@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import fnmatch
 import ipaddress
 import uuid
 from datetime import UTC, datetime
@@ -66,6 +67,105 @@ class AuditEvent(BaseModel):
     details: dict[str, Any] = Field(default_factory=dict)
     prev_hash: str | None = None
     hash: str | None = None
+
+
+def action_matches(action: str, pattern: str) -> bool:
+    """``rollover`` matches ``rollover`` and ``rollover.target.change``; ``*`` is a wildcard."""
+    if "*" in pattern:
+        return fnmatch.fnmatchcase(action, pattern)
+    return action == pattern or action.startswith(pattern + ".")
+
+
+class AuditQuery(BaseModel):
+    """Which audit events to return. Every filter given must match; a list matches any value.
+
+    The ``limit`` most recent matching events are returned, oldest first, or
+    newest first with ``newest_first``. Narrow the date range to page back.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    targets: list[str] = Field(
+        default_factory=list, description="Systems (resources) the events are about."
+    )
+    modules: list[str] = Field(default_factory=list, description="Module instance ids.")
+    actions: list[str] = Field(
+        default_factory=list,
+        description="Action types: 'rollover' also matches 'rollover.target.change'; "
+        "'*' is a wildcard.",
+    )
+    outcomes: list[Outcome] = Field(default_factory=list)
+    actors: list[str] = Field(
+        default_factory=list,
+        description="User, service or component ids; also matches events done on their behalf.",
+    )
+    run_id: str | None = None
+    since: datetime | None = Field(default=None, description="From this time (inclusive).")
+    until: datetime | None = Field(default=None, description="Up to this time (exclusive).")
+    text: str | None = Field(default=None, description="Words to find in the message.")
+    limit: int = Field(default=200, ge=1, le=100_000)
+    newest_first: bool = False
+
+    @field_validator("since", "until")
+    @classmethod
+    def _aware(cls, value: datetime | None) -> datetime | None:
+        if value is not None and value.tzinfo is None:
+            return value.replace(tzinfo=UTC)
+        return value
+
+    def matches(self, event: AuditEvent) -> bool:
+        if self.targets and event.target not in self.targets:
+            return False
+        if self.modules and event.module not in self.modules:
+            return False
+        if self.actions and not any(action_matches(event.action, p) for p in self.actions):
+            return False
+        if self.outcomes and event.outcome not in self.outcomes:
+            return False
+        if self.actors:
+            ids = {event.actor.id, event.initiated_by.id if event.initiated_by else None}
+            if not ids & set(self.actors):
+                return False
+        if self.run_id is not None and event.run_id != self.run_id:
+            return False
+        if self.since is not None and event.ts < self.since:
+            return False
+        if self.until is not None and event.ts >= self.until:
+            return False
+        if self.text:
+            haystack = f"{event.action} {event.message or ''}".lower()
+            if not all(word in haystack for word in self.text.lower().split()):
+                return False
+        return True
+
+
+class AuditFacets(BaseModel):
+    """The distinct values found in the audit log, with how many events carry each."""
+
+    events: int = 0
+    first: datetime | None = None
+    last: datetime | None = None
+    targets: dict[str, int] = Field(default_factory=dict)
+    modules: dict[str, int] = Field(default_factory=dict)
+    actions: dict[str, int] = Field(default_factory=dict)
+    actors: dict[str, int] = Field(default_factory=dict)
+
+    def add(self, event: AuditEvent) -> None:
+        self.events += 1
+        if self.first is None or event.ts < self.first:
+            self.first = event.ts
+        if self.last is None or event.ts > self.last:
+            self.last = event.ts
+        for counts, value in (
+            (self.targets, event.target),
+            (self.modules, event.module),
+            (self.actions, event.action),
+            (self.actors, event.actor.id),
+        ):
+            if value is not None:
+                counts[value] = counts.get(value, 0) + 1
+        if event.initiated_by is not None and event.initiated_by.id != event.actor.id:
+            self.actors.setdefault(event.initiated_by.id, 0)
 
 
 class ServiceAccount(BaseModel):

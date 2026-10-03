@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>SDL Rollovers</title>
+<title>SDL</title>
 <link rel="stylesheet" href="/ui/app.css">
 <script src="/ui/app.js" defer></script>
 </head>
@@ -85,6 +85,55 @@
     <section id="history" class="card" hidden>
       <h2>Recent runs</h2>
       <ul id="runs" class="runs"></ul>
+    </section>
+
+    <section id="log" class="card" hidden>
+      <div class="section-head">
+        <h2>Log</h2>
+        <div class="tools">
+          <span id="log-integrity" class="muted"></span>
+          <button id="log-verify" type="button" class="secondary">Verify integrity</button>
+        </div>
+      </div>
+      <form id="log-form" class="log-filters">
+        <label>System <select id="log-target"><option value="">All systems</option></select></label>
+        <label>Action type <select id="log-action"><option value="">All actions</option></select></label>
+        <label>Outcome
+          <select id="log-outcome">
+            <option value="">Any outcome</option>
+            <option value="success">Success</option>
+            <option value="failure">Failure</option>
+            <option value="denied">Denied</option>
+            <option value="started">Started</option>
+            <option value="info">Info</option>
+          </select>
+        </label>
+        <label>User <select id="log-actor"><option value="">Everyone</option></select></label>
+        <label>Module <select id="log-module"><option value="">All modules</option></select></label>
+        <label>From <input id="log-since" type="datetime-local"></label>
+        <label>To <input id="log-until" type="datetime-local"></label>
+        <label>Search <input id="log-q" type="search" placeholder="words in the message"></label>
+        <label>Show
+          <select id="log-limit">
+            <option value="100">100 latest</option>
+            <option value="500" selected>500 latest</option>
+            <option value="2000">2000 latest</option>
+          </select>
+        </label>
+        <div class="log-buttons">
+          <button type="submit">Show</button>
+          <button id="log-reset" type="button" class="secondary">Clear filters</button>
+        </div>
+      </form>
+      <p id="log-error" class="error" role="alert"></p>
+      <p id="log-summary" class="muted"></p>
+      <div class="table-wrap">
+        <table id="events">
+          <thead><tr><th>Time</th><th>Outcome</th><th>Action</th><th>System</th><th>Module</th><th>Who</th><th>Detail</th></tr></thead>
+          <tbody></tbody>
+        </table>
+      </div>
+      <div id="forwarders" class="forwarders"></div>
     </section>
   </div>
 </main>

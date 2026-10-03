@@ -1,5 +1,5 @@
-// SDL rollover page: pick systems from the inventory, roll them over, and
-// watch each system's result. Everything goes through the same HTTP API the
+// SDL page: pick systems from the inventory, roll them over, watch each
+// system's result, and review the audit log. Everything goes through the same HTTP API the
 // CLI uses; this page holds no state of its own beyond the tab's token.
 "use strict";
 
@@ -95,9 +95,11 @@ async function signIn(value) {
   const roles = state.me.actor.roles.join(", ");
   $("who-name").textContent = `${state.me.actor.display_name || state.me.actor.id} (${roles})`;
   $("history").hidden = !can("rollover:read");
+  $("log").hidden = !can("audit:read");
   await loadSystems();
   if (can("rollover:read")) await loadRuns();
   updateRunButton();
+  if (can("audit:read")) await loadLog();
 }
 
 function signOut(message) {
@@ -168,14 +170,20 @@ function renderSystems() {
     const box = el("input", { type: "checkbox", checked: selected, ariaLabel: `Select ${s.name}` });
     box.addEventListener("change", () => toggle(s.name, box.checked));
     const source = state.sources.find((x) => x.id === s.source);
-    let actions = null;
+    const buttons = [];
+    if (can("audit:read")) {
+      const log = el("button", { type: "button", class: "secondary" }, "Log");
+      log.addEventListener("click", (e) => { e.stopPropagation(); showSystemLog(s.name); });
+      buttons.push(log);
+    }
     if (source && source.writable && can("inventory:write")) {
       const edit = el("button", { type: "button", class: "secondary" }, "Edit");
       edit.addEventListener("click", (e) => { e.stopPropagation(); openSystemDialog(s); });
       const del = el("button", { type: "button", class: "danger" }, "Delete");
       del.addEventListener("click", (e) => { e.stopPropagation(); deleteSystem(s); });
-      actions = el("span", { class: "tools" }, edit, del);
+      buttons.push(edit, del);
     }
+    const actions = buttons.length ? el("span", { class: "tools" }, buttons) : null;
     const sa = s.service_account ? `${s.service_account.username}` : el("span", { class: "muted" }, "module default");
     const row = el("tr", { class: `selectable${selected ? " selected" : ""}` },
       el("td", { class: "check" }, box),
@@ -350,8 +358,9 @@ function showRun(run) {
     state.pollTimer = setTimeout(async () => {
       try { showRun(await api("GET", `/api/v1/rollovers/${run.id}`)); } catch { /* shown on next action */ }
     }, 1500);
-  } else if (can("rollover:read")) {
-    loadRuns();
+  } else {
+    if (can("rollover:read")) loadRuns();
+    if (can("audit:read")) loadLog();
   }
 }
 
@@ -368,6 +377,118 @@ async function loadRuns() {
       `${new Date(run.created_at).toLocaleString()} · ${run.requested_by.id} · ${summary} · ${run.reason}`);
   });
   $("runs").replaceChildren(...(items.length ? items : [el("li", { class: "muted" }, "No runs yet.")]));
+}
+
+// -- log ----------------------------------------------------------------------------
+
+const OUTCOME_LABELS = { success: "Success", failure: "Failure", denied: "Denied", started: "Started", info: "Info" };
+
+async function loadLogFacets() {
+  const facets = await api("GET", "/api/v1/audit/facets");
+  const fill = (select, values, label, describe) => {
+    const current = select.value;
+    select.replaceChildren(el("option", { value: "" }, label),
+      ...values.map((v) => el("option", { value: v }, describe ? describe(v) : v)));
+    select.value = values.includes(current) ? current : "";
+  };
+  const sorted = (counts) => Object.keys(counts).sort();
+  // Offer every action and each of its prefixes: "rollover" covers "rollover.target.change".
+  const actions = new Set();
+  for (const action of Object.keys(facets.actions)) {
+    const parts = action.split(".");
+    for (let i = 1; i <= parts.length; i++) actions.add(parts.slice(0, i).join("."));
+  }
+  const exact = new Set(Object.keys(facets.actions));
+  fill($("log-action"), [...actions].sort(), "All actions", (a) => (exact.has(a) ? a : `${a}.* (all)`));
+  fill($("log-target"), sorted(facets.targets), "All systems");
+  fill($("log-actor"), sorted(facets.actors), "Everyone");
+  fill($("log-module"), sorted(facets.modules), "All modules");
+}
+
+function logParams() {
+  const params = new URLSearchParams({ order: "newest", limit: $("log-limit").value });
+  const add = (key, id) => { const v = $(id).value.trim(); if (v) params.append(key, v); };
+  add("target", "log-target");
+  add("action", "log-action");
+  add("outcome", "log-outcome");
+  add("actor", "log-actor");
+  add("module", "log-module");
+  add("q", "log-q");
+  // datetime-local is in the browser's time zone; the API takes ISO 8601 with a zone.
+  for (const [key, id] of [["since", "log-since"], ["until", "log-until"]]) {
+    const v = $(id).value;
+    if (v) params.append(key, new Date(v).toISOString());
+  }
+  return params;
+}
+
+function eventRow(e) {
+  let who = `${e.actor.type}:${e.actor.id}`;
+  if (e.initiated_by) who += ` for ${e.initiated_by.id}`;
+  const details = Object.keys(e.details || {}).length
+    ? el("details", {}, el("summary", {}, "details"), el("pre", {}, JSON.stringify(e.details, null, 2)))
+    : null;
+  return el("tr", {},
+    el("td", { class: "nowrap mono", title: e.ts }, new Date(e.ts).toLocaleString()),
+    el("td", {}, el("span", { class: `badge o-${e.outcome}` }, OUTCOME_LABELS[e.outcome] || e.outcome)),
+    el("td", { class: "mono" }, e.action),
+    el("td", {}, e.target || ""),
+    el("td", {}, e.module || ""),
+    el("td", {}, who),
+    el("td", {}, e.message || "", e.run_id ? el("div", { class: "muted mono" }, `run ${e.run_id.slice(0, 8)}`) : null, details),
+  );
+}
+
+async function loadLog() {
+  $("log-error").textContent = "";
+  try {
+    await loadLogFacets();
+    const limit = Number($("log-limit").value);
+    const events = await api("GET", `/api/v1/audit?${logParams()}`);
+    $("events").tBodies[0].replaceChildren(...events.map(eventRow));
+    $("log-summary").textContent = events.length
+      ? `${events.length} event${events.length === 1 ? "" : "s"}, newest first${events.length >= limit ? ` (the latest ${limit}; narrow the dates to see older ones)` : ""}.`
+      : "No events match.";
+  } catch (err) {
+    $("log-error").textContent = err.message;
+  }
+  loadForwarders();
+}
+
+async function loadForwarders() {
+  let forwarders = [];
+  try { forwarders = await api("GET", "/api/v1/forwarders"); } catch { /* shown as nothing */ }
+  $("forwarders").replaceChildren(...forwarders.map((f) => el("span", { class: "chip", title: f.last_error || "" },
+    `Forwarding to ${f.id}: `,
+    el("span", { class: f.ok ? "ok-text" : "bad-text" }, f.ok ? "ok" : "retrying"),
+    ` · ${f.sent} sent · ${f.queued} queued${f.dropped ? ` · ${f.dropped} dropped` : ""}`)));
+}
+
+async function verifyLog() {
+  $("log-integrity").textContent = "Checking…";
+  try {
+    const result = await api("GET", "/api/v1/audit/verify");
+    $("log-integrity").textContent = result.detail;
+    $("log-integrity").className = result.ok ? "ok-text" : "bad-text";
+  } catch (err) {
+    $("log-integrity").textContent = err.message;
+    $("log-integrity").className = "bad-text";
+  }
+}
+
+function resetLogFilters() {
+  for (const id of ["log-target", "log-action", "log-outcome", "log-actor", "log-module", "log-since", "log-until", "log-q"]) $(id).value = "";
+}
+
+async function showSystemLog(name) {
+  resetLogFilters();
+  await loadLogFacets();
+  if (![...$("log-target").options].some((o) => o.value === name)) {
+    $("log-target").append(el("option", { value: name }, name));
+  }
+  $("log-target").value = name;
+  await loadLog();
+  $("log").scrollIntoView({ behavior: "smooth" });
 }
 
 // -- wiring -------------------------------------------------------------------------
@@ -394,6 +515,9 @@ document.addEventListener("DOMContentLoaded", () => {
   $("reason").addEventListener("input", updateRunButton);
   $("dry-run").addEventListener("change", updateRunButton);
   $("run-form").addEventListener("submit", startRun);
+  $("log-form").addEventListener("submit", (e) => { e.preventDefault(); loadLog(); });
+  $("log-reset").addEventListener("click", () => { resetLogFilters(); loadLog(); });
+  $("log-verify").addEventListener("click", verifyLog);
 
   const saved = token();
   if (saved) signIn(saved);

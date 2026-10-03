@@ -5,7 +5,15 @@ from typing import Any
 import pytest
 from pydantic import SecretStr
 
-from sdl.core.models import Actor, ActorType, RolloverRequest, RunStatus, SecretRecord, TargetStatus
+from sdl.core.models import (
+    Actor,
+    ActorType,
+    AuditQuery,
+    RolloverRequest,
+    RunStatus,
+    SecretRecord,
+    TargetStatus,
+)
 from sdl.core.orchestrator import Orchestrator, RequestError
 from tests.conftest import FakeHosts, FakeSecretsModule
 
@@ -276,7 +284,7 @@ async def test_audit_log_covers_every_step_and_never_holds_passwords(
     for secret in (new_password, "old-password-one", "old-password-two"):
         assert secret not in log_text
 
-    events = await orchestrator.audit.primary.query(run_id=run.id, limit=1000)
+    events = await orchestrator.audit.primary.query(AuditQuery(run_id=run.id, limit=1000))
     actions = [e.action for e in events if e.target == "vm1"]
     for step in (
         "connect",

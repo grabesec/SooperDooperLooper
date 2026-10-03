@@ -28,6 +28,7 @@ from sdl.core.models import (
 from sdl.core.module import (
     AuditModule,
     AuthModule,
+    ForwarderModule,
     GeneratorModule,
     InventoryModule,
     Module,
@@ -73,6 +74,7 @@ class Orchestrator:
         self.runs: dict[str, RolloverRun] = {}
         self._tasks: dict[str, asyncio.Task[None]] = {}
         self._busy_targets: set[str] = set()
+        self._inventory_down: dict[str, str] = {}
         self._started = False
 
     # -- lifecycle -----------------------------------------------------------
@@ -93,6 +95,7 @@ class Orchestrator:
         if not audit_modules:
             raise ConfigError("at least one audit module must be configured")
         self.audit.attach(audit_modules)
+        self.audit.forwarding.attach(self.all_of(ForwarderModule), self._forwarder_status)
         self._validate()
 
     async def start(self) -> None:
@@ -101,7 +104,12 @@ class Orchestrator:
         # Audit modules first so everything after them can be recorded.
         ordered = audit_modules + [m for m in self.modules.values() if m not in audit_modules]
         for module in ordered:
-            await module.start()
+            try:
+                await module.start()
+            except Exception as exc:
+                await self._record_module_failure("module.start", module, exc)
+                raise
+        self.audit.forwarding.start()
         self._started = True
         await self.audit.record(
             "system.start",
@@ -125,14 +133,41 @@ class Orchestrator:
                 task.cancel()
             await asyncio.gather(*pending, return_exceptions=True)
         await self.audit.record("system.stop", Outcome.SUCCESS, message="SDL stopping")
+        await self.audit.forwarding.stop()
         audit_modules = self.all_of(AuditModule)
         others = [m for m in self.modules.values() if m not in audit_modules]
         for module in [*reversed(others), *reversed(audit_modules)]:
             try:
                 await module.stop()
-            except Exception:
+            except Exception as exc:
                 log.exception("module %s failed to stop", module.instance_id)
+                if module not in audit_modules:
+                    await self._record_module_failure("module.stop", module, exc)
         self._started = False
+
+    async def _record_module_failure(self, action: str, module: Module, exc: Exception) -> None:
+        try:
+            await self.audit.record(
+                action,
+                Outcome.FAILURE,
+                module=module.instance_id,
+                message=_describe(exc),
+                type=self.settings.modules[module.instance_id].type,
+            )
+        except Exception:
+            log.exception("could not record that module %s failed", module.instance_id)
+
+    async def _forwarder_status(self, module: ForwarderModule, ok: bool, detail: str) -> None:
+        """Record a forwarder losing or regaining its destination (not every retry)."""
+        try:
+            await self.audit.record(
+                "forwarder.available" if ok else "forwarder.unavailable",
+                Outcome.SUCCESS if ok else Outcome.FAILURE,
+                module=module.instance_id,
+                message=detail,
+            )
+        except Exception:
+            log.exception("could not record the status of forwarder %s", module.instance_id)
 
     def _validate(self) -> None:
         if CONFIG_INVENTORY in self.modules:
@@ -260,7 +295,26 @@ class Orchestrator:
                 merge(source, [])
             else:
                 merge(source, systems)
+        await self._record_inventory_changes(result)
         return result
+
+    async def _record_inventory_changes(self, inventory: Inventory) -> None:
+        """Record an inventory becoming unavailable, and available again, once each."""
+        for source in inventory.sources:
+            was_down = source.id in self._inventory_down
+            if source.ok == (not was_down):
+                continue
+            if source.ok:
+                del self._inventory_down[source.id]
+            else:
+                self._inventory_down[source.id] = source.error or ""
+            await self.audit.record(
+                "inventory.available" if source.ok else "inventory.unavailable",
+                Outcome.SUCCESS if source.ok else Outcome.FAILURE,
+                module=source.id,
+                message=source.error,
+                systems=source.systems,
+            )
 
     async def get_system(self, name: str) -> TargetSpec:
         inventory = await self.inventory()
@@ -315,7 +369,19 @@ class Orchestrator:
             raise RequestError(f"inventory {inventory_id!r} is read-only")
         if name in self._busy_targets:
             raise ConflictError(f"rollover in progress for {name!r}; try again later")
-        if not await module.delete_system(name):
+        try:
+            deleted = await module.delete_system(name)
+        except Exception as exc:
+            await self.audit.record(
+                "inventory.system.delete",
+                Outcome.FAILURE,
+                actor=actor,
+                target=name,
+                module=inventory_id,
+                message=_describe(exc),
+            )
+            raise
+        if not deleted:
             raise NotFoundError(f"inventory {inventory_id!r} has no system named {name!r}")
         await self.audit.record(
             "inventory.system.delete",
@@ -327,7 +393,17 @@ class Orchestrator:
 
     async def refresh_inventory(self, actor: Actor) -> Inventory:
         for module in self.all_of(InventoryModule):
-            await module.refresh()
+            try:
+                await module.refresh()
+            except Exception as exc:
+                await self.audit.record(
+                    "inventory.refresh",
+                    Outcome.FAILURE,
+                    actor=actor,
+                    module=module.instance_id,
+                    message=_describe(exc),
+                )
+                raise
         inventory = await self.inventory()
         await self.audit.record(
             "inventory.refresh",

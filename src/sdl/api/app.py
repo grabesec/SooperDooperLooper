@@ -3,19 +3,24 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
 from contextlib import asynccontextmanager, contextmanager
+from datetime import datetime
 from importlib.resources import files
-from typing import Annotated, Any
+from typing import Annotated, Any, Literal
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response, status
 from fastapi.responses import RedirectResponse
 from pydantic import BaseModel
 
 from sdl import __version__
+from sdl.core.forwarding import ForwarderStatus
 from sdl.core.models import (
     Actor,
     AuditEvent,
+    AuditFacets,
+    AuditQuery,
     Inventory,
     InventorySource,
     Outcome,
@@ -140,7 +145,9 @@ def require(permission: str) -> Callable[[Request], Awaitable[Actor]]:
             message=where,
             permission=permission,
             client=client,
+            query=request.url.query or None,
         )
+        request.state.actor = actor
         return actor
 
     return dependency
@@ -164,6 +171,36 @@ def create_app(orchestrator: Orchestrator) -> FastAPI:
         lifespan=lifespan,
     )
     app.state.orchestrator = orchestrator
+
+    @app.middleware("http")
+    async def audit_failures(
+        request: Request, call_next: Callable[[Request], Awaitable[Response]]
+    ) -> Response:
+        """Record requests that were let in but then failed, so a refused action shows too."""
+        try:
+            response = await call_next(request)
+        except Exception as exc:
+            await _record_failure(request, 500, str(exc) or type(exc).__name__)
+            raise
+        if response.status_code >= 400:
+            await _record_failure(request, response.status_code, None)
+        return response
+
+    async def _record_failure(request: Request, code: int, error: str | None) -> None:
+        actor = getattr(request.state, "actor", None)
+        if actor is None:
+            return  # rejected before authentication or authorization: already recorded
+        try:
+            await orchestrator.audit.record(
+                "api.request",
+                Outcome.FAILURE,
+                actor=actor,
+                message=f"{request.method} {request.url.path}",
+                status=code,
+                error=error,
+            )
+        except Exception:
+            logging.getLogger("sdl.api").exception("could not record a failed request")
 
     @app.get("/health", tags=["system"])
     async def health() -> dict[str, str]:
@@ -315,11 +352,57 @@ def create_app(orchestrator: Orchestrator) -> FastAPI:
     @app.get("/api/v1/audit", tags=["audit"])
     async def query_audit(
         _: Annotated[Actor, Depends(require(AUDIT_READ))],
+        target: Annotated[
+            list[str] | None, Query(description="System (resource) name; repeatable.")
+        ] = None,
+        module: Annotated[list[str] | None, Query(description="Module instance id.")] = None,
+        action: Annotated[
+            list[str] | None,
+            Query(description="Action type: 'rollover' also matches 'rollover.target.change'."),
+        ] = None,
+        outcome: Annotated[list[Outcome] | None, Query()] = None,
+        actor: Annotated[
+            list[str] | None,
+            Query(description="User or component id; includes actions done on their behalf."),
+        ] = None,
         run_id: str | None = None,
-        target: str | None = None,
+        since: Annotated[datetime | None, Query(description="From (inclusive), ISO 8601.")] = None,
+        until: Annotated[datetime | None, Query(description="To (exclusive), ISO 8601.")] = None,
+        q: Annotated[str | None, Query(description="Words to find in the message.")] = None,
         limit: Annotated[int, Query(ge=1, le=10000)] = 200,
+        order: Annotated[
+            Literal["oldest", "newest"], Query(description="Order of the returned events.")
+        ] = "oldest",
     ) -> list[AuditEvent]:
-        return await orchestrator.audit.primary.query(run_id=run_id, target=target, limit=limit)
+        """The ``limit`` most recent events matching every filter given."""
+        query = AuditQuery(
+            targets=target or [],
+            modules=module or [],
+            actions=action or [],
+            outcomes=outcome or [],
+            actors=actor or [],
+            run_id=run_id,
+            since=since,
+            until=until,
+            text=q,
+            limit=limit,
+            newest_first=order == "newest",
+        )
+        return await orchestrator.audit.primary.query(query)
+
+    @app.get("/api/v1/audit/facets", tags=["audit"])
+    async def audit_facets(
+        _: Annotated[Actor, Depends(require(AUDIT_READ))],
+    ) -> AuditFacets:
+        """Systems, modules, action types and actors found in the log, to filter by."""
+        return await orchestrator.audit.primary.facets()
+
+    @app.get("/api/v1/forwarders", tags=["audit"])
+    async def forwarders(
+        _: Annotated[Actor, Depends(require(AUDIT_READ))],
+    ) -> list[ForwarderStatus]:
+        """Delivery status of every forwarder module (syslog, Graylog, Splunk, ...)."""
+        return orchestrator.audit.forwarding.status()
 
     @app.get("/api/v1/audit/verify", tags=["audit"])
     async def verify_audit(

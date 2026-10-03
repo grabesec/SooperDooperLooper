@@ -6,7 +6,8 @@ import httpx
 import pytest
 
 from sdl.core.audit import AuditRecorder
-from sdl.core.module import ModuleContext, ModuleError
+from sdl.core.models import AuditEvent, AuditQuery
+from sdl.core.module import AuditModule, ModuleConfig, ModuleContext, ModuleError
 from sdl.modules.inventory_netbox import NetBoxConfig, NetBoxInventoryModule
 
 VMS = [
@@ -84,13 +85,26 @@ class FakeNetBox:
         return httpx.Response(404)
 
 
+class MemoryAudit(AuditModule):
+    def __init__(self) -> None:
+        super().__init__(ModuleConfig(), ModuleContext("memory", AuditRecorder()))
+        self.events: list[AuditEvent] = []
+
+    async def write(self, event: AuditEvent) -> AuditEvent:
+        self.events.append(event)
+        return event
+
+    async def query(self, query: AuditQuery) -> list[AuditEvent]:
+        return [e for e in self.events if query.matches(e)][-query.limit :]
+
+
 async def make(
     netbox: FakeNetBox, monkeypatch: pytest.MonkeyPatch, **config: Any
 ) -> NetBoxInventoryModule:
     monkeypatch.setenv("NETBOX_TOKEN", netbox.token)
     module = NetBoxInventoryModule(
         NetBoxConfig.model_validate({"url": "http://netbox.test", **config}),
-        ModuleContext("netbox", AuditRecorder()),
+        ModuleContext("netbox", AuditRecorder([MemoryAudit()])),
     )
     module._transport = httpx.MockTransport(netbox.handler)
     await module.start()
@@ -112,6 +126,10 @@ async def test_maps_virtual_machines_to_systems(monkeypatch: pytest.MonkeyPatch)
     systems = {s.name: s for s in await module.list_systems()}
     assert set(systems) == {"web1", "db1"}
     assert module.skipped == {"no-ip": "no primary IP address"}
+    [audit] = module.context.audit._modules
+    assert isinstance(audit, MemoryAudit)
+    [event] = [e for e in audit.events if e.action == "inventory.objects_skipped"]
+    assert event.module == "netbox" and event.details["objects"] == module.skipped
 
     web1 = systems["web1"]
     assert web1.hostname == "web1"

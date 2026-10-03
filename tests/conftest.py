@@ -6,8 +6,16 @@ from typing import Any
 import pytest
 from pydantic import Field, SecretStr
 
-from sdl.core.models import SecretRecord, ServiceCredential, TargetSpec
-from sdl.core.module import ModuleConfig, ModuleError, SecretsModule, TargetModule, TargetSession
+from sdl.core.models import AuditEvent, SecretRecord, ServiceCredential, TargetSpec
+from sdl.core.module import (
+    ForwarderConfig,
+    ForwarderModule,
+    ModuleConfig,
+    ModuleError,
+    SecretsModule,
+    TargetModule,
+    TargetSession,
+)
 from sdl.core.orchestrator import Orchestrator
 from sdl.core.registry import ModuleRegistry
 from sdl.core.settings import Settings
@@ -102,10 +110,39 @@ class FakeSecretsModule(SecretsModule):
         self.store.pop(path, None)
 
 
+class FakeForwarderConfig(ForwarderConfig):
+    fail: bool = False
+    fail_start: bool = False
+
+
+class FakeForwarderModule(ForwarderModule):
+    """Collects what it is sent; ``down`` makes every delivery fail until cleared."""
+
+    Config = FakeForwarderConfig
+    config: FakeForwarderConfig
+
+    def __init__(self, config: Any, context: Any) -> None:
+        super().__init__(config, context)
+        self.received: list[AuditEvent] = []
+        self.batches = 0
+        self.down = self.config.fail
+
+    async def start(self) -> None:
+        if self.config.fail_start:
+            raise ModuleError("cannot open the log concentrator's certificate")
+
+    async def send(self, events: list[AuditEvent]) -> None:
+        if self.down:
+            raise ModuleError("connection refused")
+        self.batches += 1
+        self.received.extend(events)
+
+
 def make_registry() -> ModuleRegistry:
     registry = ModuleRegistry.from_entry_points()
     registry.register("target.fake", FakeTargetModule)
     registry.register("secrets.fake", FakeSecretsModule)
+    registry.register("forwarder.fake", FakeForwarderModule)
     return registry
 
 

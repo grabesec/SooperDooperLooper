@@ -39,7 +39,7 @@ from typing import Any, Literal
 import httpx
 from pydantic import BaseModel, ConfigDict, Field, SecretStr, ValidationError, field_validator
 
-from sdl.core.models import ServiceAccount, TargetSpec
+from sdl.core.models import Outcome, ServiceAccount, TargetSpec
 from sdl.core.module import InventoryModule, ModuleConfig, ModuleError
 
 log = logging.getLogger("sdl.inventory.netbox")
@@ -216,6 +216,14 @@ class NetBoxInventoryModule(InventoryModule):
         if skipped:
             log.warning(
                 "netbox %s: skipped %d object(s): %s", self.instance_id, len(skipped), skipped
+            )
+        if skipped and skipped != self.skipped:
+            await self.context.audit.record(
+                "inventory.objects_skipped",
+                Outcome.INFO,
+                module=self.instance_id,
+                message=f"{len(skipped)} NetBox object(s) could not be turned into systems",
+                objects=skipped,
             )
         self.skipped = skipped
         return systems

@@ -8,6 +8,26 @@ modules:
     config:
       path: /var/lib/sdl/audit.jsonl
 
+  # Copies of the audit log for a log concentrator; see docs/logs.md.
+  # Forwarding never slows down or blocks the local audit log above.
+  # syslog:
+  #   type: forwarder.syslog
+  #   config:
+  #     host: logs.example.com
+  #     protocol: tls          # udp, tcp or tls
+  #     ca_cert: /etc/sdl/logs-ca.pem
+  # graylog:
+  #   type: forwarder.gelf
+  #   config:
+  #     url: http://graylog.example.com:12201/gelf
+  # splunk:
+  #   type: forwarder.splunk_hec
+  #   config:
+  #     url: https://splunk.example.com:8088
+  #     token_env: SPLUNK_HEC_TOKEN
+  #     index: security
+  #     exclude_actions: [api.request]   # skip read-only API calls
+
   # API clients. Create entries with: sdl token new --id <name> --role operator
   auth:
     type: auth.static_token

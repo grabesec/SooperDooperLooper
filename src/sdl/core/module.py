@@ -22,9 +22,17 @@ from abc import ABC, abstractmethod
 from enum import StrEnum
 from typing import TYPE_CHECKING, Any, ClassVar
 
-from pydantic import BaseModel, ConfigDict, SecretStr
+from pydantic import BaseModel, ConfigDict, Field, SecretStr
 
-from sdl.core.models import Actor, AuditEvent, SecretRecord, ServiceCredential, TargetSpec
+from sdl.core.models import (
+    Actor,
+    AuditEvent,
+    AuditFacets,
+    AuditQuery,
+    SecretRecord,
+    ServiceCredential,
+    TargetSpec,
+)
 
 if TYPE_CHECKING:
     from fastapi import APIRouter, Request
@@ -35,6 +43,7 @@ if TYPE_CHECKING:
 class ModuleKind(StrEnum):
     AUDIT = "audit"
     AUTH = "auth"
+    FORWARDER = "forwarder"
     GENERATOR = "generator"
     INVENTORY = "inventory"
     SECRETS = "secrets"
@@ -94,10 +103,18 @@ class AuditModule(Module):
         """Persist the event and return it as stored (for example, with its hash filled in)."""
 
     @abstractmethod
-    async def query(
-        self, *, run_id: str | None = None, target: str | None = None, limit: int = 100
-    ) -> list[AuditEvent]:
-        """Return the most recent matching events, oldest first."""
+    async def query(self, query: AuditQuery) -> list[AuditEvent]:
+        """Return the ``query.limit`` most recent events ``query.matches``.
+
+        Oldest first, or newest first when ``query.newest_first`` is set.
+        """
+
+    async def facets(self) -> AuditFacets:
+        """Summarise the log: which systems, modules, actions and actors appear in it."""
+        facets = AuditFacets()
+        for event in await self.query(AuditQuery(limit=100_000)):
+            facets.add(event)
+        return facets
 
     async def verify(self) -> tuple[bool, str]:
         """Check the log has not been tampered with, if the module can tell."""
@@ -112,6 +129,49 @@ class AuthModule(Module):
     @abstractmethod
     async def authenticate(self, request: Request) -> Actor | None:
         """Return the caller, or None when the request carries no valid credentials."""
+
+
+class ForwarderConfig(ModuleConfig):
+    """Settings every forwarder has; the core uses them to queue and deliver events."""
+
+    actions: list[str] = Field(
+        default_factory=list,
+        description="Only forward these action types ('rollover', 'api.*', ...); default all.",
+    )
+    exclude_actions: list[str] = Field(
+        default_factory=list, description="Never forward these action types."
+    )
+    queue_size: int = Field(
+        default=10_000,
+        ge=1,
+        description="Events held while the destination is unreachable; the oldest are "
+        "dropped beyond this (they stay in the local audit log).",
+    )
+    batch_size: int = Field(default=100, ge=1, le=10_000)
+    retry_max_delay: float = Field(
+        default=60, gt=0, description="Longest wait, in seconds, between delivery attempts."
+    )
+    flush_timeout: float = Field(
+        default=5, ge=0, description="Seconds to keep delivering queued events on shutdown."
+    )
+
+
+class ForwarderModule(Module):
+    """Ships audit events to another system: syslog, Graylog, Splunk, a SIEM...
+
+    The core queues every stored event for every forwarder and calls ``send``
+    from a background task, in batches, retrying with back-off when it raises.
+    A forwarder never slows down or breaks the local audit log: when the
+    destination is down, events wait in the queue (up to ``queue_size``).
+    """
+
+    kind = ModuleKind.FORWARDER
+    Config: ClassVar[type[ModuleConfig]] = ForwarderConfig
+    config: ForwarderConfig
+
+    @abstractmethod
+    async def send(self, events: list[AuditEvent]) -> None:
+        """Deliver the events, in order. Raise to have the whole batch retried later."""
 
 
 class GeneratorModule(Module):
