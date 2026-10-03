@@ -46,3 +46,15 @@ jobs:
         run: pytest -m integration -v
         env:
           SDL_INTEGRATION: "1"
+
+  lab:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Start the manual QA lab
+        run: ./lab/lab.sh up
+      - name: Smoke-test the lab
+        run: ./lab/lab.sh smoke
+      - name: Lab logs
+        if: failure()
+        run: docker compose -f lab/docker-compose.yml logs

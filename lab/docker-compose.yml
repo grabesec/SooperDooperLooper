@@ -1,0 +1,108 @@
+# SDL manual QA lab: SDL itself, a Vault, four Linux "VMs" and a log sink.
+# Start it with ./lab/lab.sh up; docs/manual-qa.md walks through what to test.
+#
+#   web1 -> vm1   SDL inventory, service account key read from Vault
+#   web2 -> vm2   SDL inventory, a different distribution (LAB_VM2_BASE)
+#   db1  -> vm3   SDL inventory, service account has NO sudo rule (fails on purpose)
+#   app1 -> vm4   listed in sdl.yaml, service account key from a file
+#
+# Everything listens on 127.0.0.1 only. The tokens and passwords here are lab
+# values, published in this repository: never reuse them anywhere real.
+name: sdl-lab
+
+# Each VM keeps its /etc in a volume, so a rolled-over root password (and the
+# host keys SDL trusts) survive the container being recreated.
+x-vm: &vm
+  build:
+    context: ../tests/integration/vm
+  image: sdl-lab-vm
+  environment: &vm-env
+    SDL_PUBKEY_FILE: /lab-keys/id_ed25519.pub
+    ROOT_PASSWORD: lab-initial-password
+  restart: unless-stopped
+
+services:
+  sdl:
+    build:
+      context: ..
+      dockerfile: lab/Dockerfile.sdl
+    image: sdl-lab-sdl
+    environment:
+      VAULT_ADDR: http://vault:8200
+      VAULT_TOKEN: sdl-lab-root
+      SPLUNK_HEC_TOKEN: lab-hec-token
+    volumes: ["state:/lab/state", "keys:/lab/keys"]
+    ports: ["127.0.0.1:${LAB_SDL_PORT:-8800}:8800"]
+    depends_on:
+      vault: {condition: service_healthy}
+      sink: {condition: service_started}
+      vm1: {condition: service_started}
+      vm2: {condition: service_started}
+      vm3: {condition: service_started}
+      vm4: {condition: service_started}
+    healthcheck:
+      test: ["CMD", "python", "/opt/lab/labctl.py", "ready"]
+      interval: 3s
+      retries: 100
+    restart: unless-stopped
+
+  vault:
+    image: hashicorp/vault:1.17
+    entrypoint: ["/bin/sh", "/lab/entrypoint.sh"]
+    environment:
+      LAB_VAULT_TOKEN: sdl-lab-root
+    cap_add: [IPC_LOCK]
+    volumes: ["./vault:/lab:ro", "vault:/vault/file"]
+    ports: ["127.0.0.1:${LAB_VAULT_PORT:-8200}:8200"]
+    healthcheck:
+      test: ["CMD-SHELL", "test -e /tmp/lab-ready && VAULT_ADDR=http://127.0.0.1:8200 vault status >/dev/null"]
+      interval: 2s
+      retries: 60
+    restart: unless-stopped
+
+  # Receives what SDL forwards over syslog, GELF (Graylog) and Splunk HEC,
+  # and shows it at http://127.0.0.1:8900/.
+  sink:
+    image: python:3.12-slim
+    command: ["python", "-u", "/lab/sink.py"]
+    environment:
+      SPLUNK_HEC_TOKEN: lab-hec-token
+    volumes: ["./sink:/lab:ro"]
+    ports: ["127.0.0.1:${LAB_SINK_PORT:-8900}:8900"]
+    restart: unless-stopped
+
+  vm1:
+    <<: *vm
+    volumes: ["keys:/lab-keys:ro", "vm1-etc:/etc"]
+    ports: ["127.0.0.1:2221:22"]
+
+  vm2:
+    <<: *vm
+    volumes: ["keys:/lab-keys:ro", "vm2-etc:/etc"]
+    build:
+      context: ../tests/integration/vm
+      args: {BASE: "${LAB_VM2_BASE:-debian:12-slim}"}
+    image: sdl-lab-vm2
+    ports: ["127.0.0.1:2222:22"]
+
+  vm3:
+    <<: *vm
+    volumes: ["keys:/lab-keys:ro", "vm3-etc:/etc"]
+    environment:
+      <<: *vm-env
+      SDL_SUDO: "0"
+    ports: ["127.0.0.1:2223:22"]
+
+  vm4:
+    <<: *vm
+    volumes: ["keys:/lab-keys:ro", "vm4-etc:/etc"]
+    ports: ["127.0.0.1:2224:22"]
+
+volumes:
+  state:
+  keys:
+  vault:
+  vm1-etc:
+  vm2-etc:
+  vm3-etc:
+  vm4-etc:
