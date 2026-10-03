@@ -9,13 +9,16 @@ speaks SSH, talks to a secret manager or writes a log file itself; modules do.
                                      │  HTTP API (FastAPI)
 ┌────────────────────────────────────┴───────────────────────────────────────────┐
 │ core: orchestrator · inventory merge · rollover workflow · audit · permissions │
+│       identity: superuser file · sign-in · sessions · TOTP · access            │
 └──┬──────────┬───────────────┬────────────────┬────────────────┬────────────┬───┘
    │ audit    │ auth          │ generator      │ inventory      │ secrets    │ target
  audit.jsonl  auth.static_    generator.       inventory.store  secrets.     target.ssh_linux
    │          token           password         inventory.netbox vault        (Windows, DBs, ...)
-   │          (OIDC, Entra                     (CMDBs, ...)     (Bitwarden,
-   │           ID, ...)                                          ...)
-   └─ forwarder: forwarder.syslog · forwarder.gelf (Graylog) · forwarder.splunk_hec
+   │          (API tokens)                     (CMDBs, ...)     (Bitwarden,
+   │                                                             ...)
+   ├─ forwarder: forwarder.syslog · forwarder.gelf (Graylog) · forwarder.splunk_hec
+   ├─ users: users.store (local users, records of directory users)
+   └─ idp: idp.ldap (AD, LDAP) · idp.oidc (Entra ID, Okta, ...) · idp.saml
 ```
 
 ## Modules
@@ -33,12 +36,14 @@ third-party package would register its own:
 | Contract          | Must implement                                   |
 |-------------------|--------------------------------------------------|
 | `AuditModule`     | `write(event)`, `query(AuditQuery)`, optionally `facets()`, `verify()` |
-| `AuthModule`      | `authenticate(request) -> Actor or None`         |
+| `AuthModule`      | `authenticate(request) -> Actor or None` (API tokens) |
+| `IdentityProviderModule` | `authenticate(username, password)` (LDAP) or `begin()` / `complete()` (single sign-on); optionally `search_users()` |
 | `ForwarderModule` | `send(events)`; the core queues, batches and retries |
 | `GeneratorModule` | `generate(target) -> SecretStr`                  |
 | `InventoryModule` | `list_systems()`; writable ones also `put_system()`, `delete_system()` |
 | `SecretsModule`   | `read(path)`, `write(path, record)`, `delete(path)` |
 | `TargetModule`    | `open_session(target, credential) -> TargetSession` with `preflight()`, `set_credential()`, `verify_credential()` |
+| `UserStoreModule` | `list_users()`, `get_user()`, `put_user()`, `delete_user()` |
 
 Every module also gets:
 
@@ -57,6 +62,9 @@ twice with different settings (the integration tests run two
 
 Every action goes through the core's `AuditRecorder`:
 
+- sign-in: every sign-in (and failure, lockout, refusal), sign-out, password
+  change or reset, authenticator set-up or reset, and every user added,
+  changed (before and after), provisioned, imported or removed;
 - API calls: each authenticated request (`api.request`, with its query
   string), every rejected one (`api.authenticate`, `api.authorize`), and every
   request that was let in but then failed (`api.request` with outcome
@@ -81,20 +89,28 @@ described in [logs.md](logs.md).
 
 ## Access control
 
-Auth modules establish *who* is calling and which roles they hold; the core
-(`sdl/core/permissions.py`) decides what each role may do, so every IAM
-provider gets the same rules.
+The core's identity service (`sdl/core/identity.py`) establishes *who* is
+calling: the superuser from its file, a local user from the user-store
+module, a directory or single sign-on user through an identity-provider
+module, or a machine client through an auth module (API token). Providers
+only say who someone is and which of their groups they belong to; the core
+maps groups to SDL roles and access, so every IAM provider gets the same rules.
 
-| Role       | May                                              |
-|------------|--------------------------------------------------|
-| `admin`    | everything, including editing the inventory      |
-| `operator` | run and read rollovers, list systems             |
-| `auditor`  | read rollovers, list systems, read the audit log |
+Two independent things then decide what a caller can do:
+
+- **roles** (`sdl/core/permissions.py`): `admin`, `operator`, `auditor`
+  (and `superuser`, held only by the superuser) grant permissions;
+- **access** (`Access` in `sdl/core/models.py`): the inventory groups and
+  individual systems the caller reaches, or every system. The core filters the
+  inventory, rollovers, run reports and the audit log by it.
+
+Sign-in protection (password policy, Argon2id, lockout, TOTP, sessions) is
+also in the core, so a new provider cannot weaken it. See [users.md](users.md).
 
 ## Seams for what comes next
 
-- **IAM** (OIDC/OAuth, Entra ID, ...): new `AuthModule`s; the API already
-  takes its identity from whichever auth module is configured.
+- **More identity providers** (RADIUS, Okta's own API, ...): new
+  `IdentityProviderModule`s; **another user database**: a new `UserStoreModule`.
 - **Configuration module**: modules come from `sdl.yaml` today
   (`sdl/core/settings.py`); a config module can supply the same `Settings`.
   Systems already come from inventory modules ([inventory.md](inventory.md)).

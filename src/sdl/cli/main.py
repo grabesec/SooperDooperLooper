@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import argparse
+import getpass
 import json
 import os
 import secrets
 import sys
 import time
 from datetime import date, datetime, timedelta
+from pathlib import Path
 from typing import Any
 from urllib.parse import quote as _quote
 
@@ -86,6 +88,11 @@ def cmd_token_new(args: argparse.Namespace) -> int:
     print(f"Token (give this to the client, it is not stored anywhere):\n  {token}\n")
     print("Add this to the static token auth module's clients in sdl.yaml:")
     print(f"  - id: {args.id}\n    token_sha256: {hash_token(token)}\n    roles: [{args.role}]")
+    if args.group or args.system:
+        print(
+            f"    access: {{groups: [{', '.join(split_values(args.group or []))}], "
+            f"systems: [{', '.join(split_values(args.system or []))}]}}"
+        )
     return 0
 
 
@@ -96,16 +103,446 @@ def cmd_token_hash(args: argparse.Namespace) -> int:
     return 0
 
 
+def read_password(prompt: str, *, confirm: bool = True, stdin: bool = False) -> str:
+    """Ask for a password without echoing it (or read one line from stdin, for scripts)."""
+    if stdin:
+        return sys.stdin.readline().rstrip("\n")
+    password = getpass.getpass(f"{prompt}: ")
+    if confirm and getpass.getpass(f"{prompt} (again): ") != password:
+        raise CliError("the passwords do not match")
+    return password
+
+
+def cmd_superuser_set(args: argparse.Namespace) -> int:
+    from pydantic import SecretStr, ValidationError
+
+    from sdl.core import passwords, superuser, totp
+
+    path = Path(args.file)
+    current = None
+    if path.exists():
+        current = superuser.load(path)
+    if current is None and not args.name:
+        raise CliError("--name is needed to create the superuser file")
+    name = (args.name or (current.name if current else "")).strip().lower()
+    if args.keep_password:
+        if current is None:
+            raise CliError("there is no password to keep yet")
+        password_hash = current.password_hash
+    else:
+        password = read_password("Superuser password", stdin=args.password_stdin)
+        try:
+            passwords.check_policy(password, args.min_length, name=name)
+        except passwords.PasswordPolicyError as exc:
+            raise CliError(str(exc)) from exc
+        password_hash = passwords.hash_password(password)
+    totp_secret = current.totp_secret if current else None
+    new_totp = None
+    if args.no_totp:
+        totp_secret = None
+    elif args.totp:
+        new_totp = totp.new_secret()
+        print("Add this account to an authenticator app, then enter the code it shows.")
+        print(f"  Secret: {new_totp}")
+        print(f"  Link:   {totp.provisioning_uri(new_totp, name)}")
+        code = input("Code: ").strip()
+        if totp.verify(new_totp, code) is None:
+            raise CliError("that code is not right; nothing was changed")
+        totp_secret = SecretStr(new_totp)
+    try:
+        record = superuser.Superuser(
+            name=name,
+            display_name=args.display_name or (current.display_name if current else None),
+            password_hash=password_hash,
+            totp_secret=totp_secret,
+        )
+    except ValidationError as exc:
+        raise CliError(f"invalid superuser name {name!r}") from exc
+    superuser.save(path, record)
+    mfa = "with" if totp_secret else "without"
+    print(f"{path}: superuser {name!r} saved ({mfa} TOTP); sessions of the superuser have ended")
+    return 0
+
+
+def cmd_superuser_show(args: argparse.Namespace) -> int:
+    from sdl.core import superuser
+
+    record = superuser.load(Path(args.file))
+    print(f"name:       {record.name}")
+    print(f"TOTP:       {'yes' if record.totp_secret else 'no'}")
+    print(f"updated at: {record.updated_at.isoformat()}")
+    return 0
+
+
 # -- client commands -----------------------------------------------------------
 
 
+def session_file() -> Path:
+    base = os.environ.get("XDG_CONFIG_HOME") or os.path.join(Path.home(), ".config")
+    return Path(base) / "sdl" / "session.json"
+
+
+def saved_session(url: str) -> str | None:
+    try:
+        data = json.loads(session_file().read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if data.get("url") != url.rstrip("/"):
+        return None
+    token = data.get("token")
+    return token if isinstance(token, str) else None
+
+
+def save_session(url: str, token: str, user: str) -> None:
+    path = session_file()
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        json.dump({"url": url.rstrip("/"), "token": token, "user": user}, fh)
+
+
 def client(args: argparse.Namespace) -> httpx.Client:
-    token = os.environ.get("SDL_TOKEN")
+    token = os.environ.get("SDL_TOKEN") or saved_session(args.url)
     if not token:
-        raise CliError("set SDL_TOKEN to your API token")
+        raise CliError("sign in with 'sdl login', or set SDL_TOKEN to an API token")
     return httpx.Client(
         base_url=args.url, headers={"Authorization": f"Bearer {token}"}, timeout=args.http_timeout
     )
+
+
+def anonymous(args: argparse.Namespace) -> httpx.Client:
+    return httpx.Client(base_url=args.url, timeout=args.http_timeout)
+
+
+def print_pending(pending: list[str]) -> None:
+    if "password_change" in pending:
+        print("You must choose a new password first: run 'sdl passwd'.")
+    if "mfa_enrollment" in pending:
+        print("You must set up an authenticator app first: run 'sdl mfa setup'.")
+
+
+def cmd_login(args: argparse.Namespace) -> int:
+    with anonymous(args) as http:
+        if args.sso:
+            start = f"{args.url.rstrip('/')}/api/v1/auth/sso/{quote(args.sso)}/start?return_to=cli"
+            print(f"Open this address in a browser and sign in:\n  {start}\n")
+            code = input("Then paste the code the page shows: ").strip()
+            result = call(http, "POST", "/api/v1/auth/sso/exchange", json={"code": code})
+        else:
+            username = args.user or input("User name: ").strip()
+            password = read_password("Password", confirm=False, stdin=args.password_stdin)
+            body: dict[str, Any] = {
+                "username": username,
+                "password": password,
+                "provider": args.provider,
+                "code": args.code,
+            }
+            response = http.post("/api/v1/auth/login", json=body)
+            detail = _detail(response)
+            if (
+                response.status_code == 401
+                and isinstance(detail, dict)
+                and detail.get("mfa_required")
+            ):
+                body["code"] = input("Code from your authenticator app: ").strip()
+                response = http.post("/api/v1/auth/login", json=body)
+            if response.status_code >= 400:
+                raise CliError(f"{response.status_code}: {_message(_detail(response))}")
+            result = response.json()
+    actor = result["actor"]
+    save_session(args.url, result["token"], actor["id"])
+    print(f"Signed in as {actor['id']} until {result['expires_at']}.")
+    print_pending(result.get("pending", []))
+    return 0
+
+
+def _detail(response: httpx.Response) -> Any:
+    try:
+        return response.json().get("detail", response.text)
+    except ValueError:
+        return response.text
+
+
+def _message(detail: Any) -> str:
+    return str(detail.get("message", detail)) if isinstance(detail, dict) else str(detail)
+
+
+def cmd_logout(args: argparse.Namespace) -> int:
+    if saved_session(args.url):
+        with client(args) as http:
+            try:
+                call(http, "POST", "/api/v1/auth/logout")
+            except CliError:
+                pass  # already ended on the server
+    session_file().unlink(missing_ok=True)
+    print("Signed out.")
+    return 0
+
+
+def describe_access(access: dict[str, Any] | None) -> str:
+    if access is None or access.get("all_systems"):
+        return "all systems"
+    parts = [f"group {g}" for g in access.get("groups", [])]
+    parts += [f"system {s}" for s in access.get("systems", [])]
+    return ", ".join(parts) or "no systems"
+
+
+def cmd_whoami(args: argparse.Namespace) -> int:
+    with client(args) as http:
+        me = call(http, "GET", "/api/v1/me")
+    if args.json:
+        print(json.dumps(me, indent=2))
+        return 0
+    actor = me["actor"]
+    print(
+        f"user:         {actor['id']}"
+        + (f" ({actor['display_name']})" if actor.get("display_name") else "")
+    )
+    print(f"signed in:    {me.get('signed_in_with') or 'API token'}")
+    print(f"roles:        {', '.join(actor['roles']) or '-'}")
+    print(f"reaches:      {describe_access(me.get('access'))}")
+    print(f"permissions:  {', '.join(me['permissions'])}")
+    print(f"TOTP:         {'yes' if me.get('mfa') else 'no'}")
+    print_pending(me.get("pending", []))
+    return 0
+
+
+def cmd_passwd(args: argparse.Namespace) -> int:
+    current = read_password("Current password", confirm=False)
+    new = read_password("New password")
+    with client(args) as http:
+        call(
+            http,
+            "POST",
+            "/api/v1/me/password",
+            json={"current_password": current, "new_password": new},
+        )
+    print("Password changed; your other sessions have ended.")
+    return 0
+
+
+def cmd_mfa_setup(args: argparse.Namespace) -> int:
+    with client(args) as http:
+        enrollment = call(http, "POST", "/api/v1/me/mfa/totp")
+        print("Add this account to an authenticator app (scan the link as a QR code, or type")
+        print("the secret in), then enter the code it shows.")
+        print(f"  Secret: {enrollment['secret']}")
+        print(f"  Link:   {enrollment['uri']}")
+        code = input("Code: ").strip()
+        call(http, "POST", "/api/v1/me/mfa/totp/confirm", json={"code": code})
+    print("Authenticator set up: SDL will ask for a code at every sign-in.")
+    return 0
+
+
+def access_from_args(
+    args: argparse.Namespace, current: dict[str, Any] | None = None
+) -> dict[str, Any] | None:
+    """Build the ``access`` of a user from --group/--system/--all-systems (and add/remove)."""
+    replace = args.group is not None or args.system is not None
+    changes = any(
+        getattr(args, k, None) for k in ("add_group", "remove_group", "add_system", "remove_system")
+    )
+    if not (replace or changes or args.all_systems is not None):
+        return None
+    access = dict(current or {"all_systems": False, "groups": [], "systems": []})
+    if args.group is not None:
+        access["groups"] = split_values(args.group)
+    if args.system is not None:
+        access["systems"] = split_values(args.system)
+    for key, add, remove in (
+        ("groups", getattr(args, "add_group", None), getattr(args, "remove_group", None)),
+        ("systems", getattr(args, "add_system", None), getattr(args, "remove_system", None)),
+    ):
+        values = [v for v in access[key] if v not in split_values(remove or [])]
+        access[key] = values + [v for v in split_values(add or []) if v not in values]
+    if args.all_systems is not None:
+        access["all_systems"] = args.all_systems
+    return access
+
+
+def split_values(values: list[str]) -> list[str]:
+    return [v.strip() for value in values for v in value.split(",") if v.strip()]
+
+
+def print_users(users: list[dict[str, Any]]) -> None:
+    rows: list[tuple[str, ...]] = [
+        ("NAME", "DISPLAY NAME", "SOURCE", "STATE", "ROLES", "REACHES", "TOTP", "LAST SIGN-IN")
+    ]
+    for u in users:
+        state = "enabled" if u["enabled"] else "DISABLED"
+        if u["must_change_password"]:
+            state += ", must change password"
+        rows.append(
+            (
+                u["name"],
+                u.get("display_name") or "-",
+                u["source"],
+                state,
+                ",".join(u["roles"]) or "-",
+                describe_access(u["access"]),
+                "yes" if u["mfa"] else "no",
+                u.get("last_login") or "never",
+            )
+        )
+    print_table(rows)
+
+
+def cmd_users_list(args: argparse.Namespace) -> int:
+    with client(args) as http:
+        users = call(http, "GET", "/api/v1/users")
+    if args.json:
+        print(json.dumps(users, indent=2))
+    elif users:
+        print_users(users)
+    else:
+        print("no users yet; add one with 'sdl users add'", file=sys.stderr)
+    return 0
+
+
+def cmd_users_show(args: argparse.Namespace) -> int:
+    with client(args) as http:
+        user = call(http, "GET", f"/api/v1/users/{quote(args.name)}")
+    print(json.dumps(user, indent=2) if args.json else yaml_dump(user))
+    return 0
+
+
+def cmd_users_add(args: argparse.Namespace) -> int:
+    body: dict[str, Any] = {
+        "name": args.name,
+        "display_name": args.display_name,
+        "email": args.email,
+        "roles": split_values(args.role or []),
+        "access": access_from_args(args) or {},
+        "enabled": not args.disabled,
+    }
+    if not args.no_password:
+        body["password"] = read_password(
+            f"Initial password for {args.name}", stdin=args.password_stdin
+        )
+    with client(args) as http:
+        user = call(http, "POST", "/api/v1/users", json=body)
+    print(
+        f"{user['name']}: added ({', '.join(user['roles']) or 'no roles'}; reaches "
+        f"{describe_access(user['access'])})"
+    )
+    if user["must_change_password"]:
+        print("They must choose a new password at first sign-in.")
+    return 0
+
+
+def cmd_users_set(args: argparse.Namespace) -> int:
+    with client(args) as http:
+        current = call(http, "GET", f"/api/v1/users/{quote(args.name)}")
+        body: dict[str, Any] = {}
+        roles = list(current["roles"])
+        if args.role is not None:
+            roles = split_values(args.role)
+        roles = [r for r in roles if r not in split_values(args.remove_role or [])]
+        roles += [r for r in split_values(args.add_role or []) if r not in roles]
+        if roles != current["roles"]:
+            body["roles"] = roles
+        access = access_from_args(args, current["access"])
+        if access is not None:
+            body["access"] = access
+        if args.enabled is not None:
+            body["enabled"] = args.enabled
+        for key in ("display_name", "email"):
+            if getattr(args, key) is not None:
+                body[key] = getattr(args, key)
+        if not body:
+            raise CliError("nothing to change")
+        user = call(http, "PATCH", f"/api/v1/users/{quote(args.name)}", json=body)
+    print_users([user])
+    return 0
+
+
+def cmd_users_remove(args: argparse.Namespace) -> int:
+    with client(args) as http:
+        for name in args.names:
+            call(http, "DELETE", f"/api/v1/users/{quote(name)}")
+            print(f"{name}: removed")
+    return 0
+
+
+def cmd_users_password(args: argparse.Namespace) -> int:
+    password = read_password(f"New password for {args.name}", stdin=args.password_stdin)
+    with client(args) as http:
+        call(
+            http,
+            "POST",
+            f"/api/v1/users/{quote(args.name)}/password",
+            json={"password": password, "temporary": not args.permanent},
+        )
+    then = "" if args.permanent else "; they must change it at next sign-in"
+    print(f"{args.name}: password set{then}")
+    return 0
+
+
+def cmd_users_reset_mfa(args: argparse.Namespace) -> int:
+    with client(args) as http:
+        call(http, "DELETE", f"/api/v1/users/{quote(args.name)}/mfa")
+    print(f"{args.name}: authenticator removed; they can set up a new one after signing in")
+    return 0
+
+
+def cmd_users_unlock(args: argparse.Namespace) -> int:
+    with client(args) as http:
+        call(http, "POST", f"/api/v1/users/{quote(args.name)}/unlock")
+    print(f"{args.name}: unlocked")
+    return 0
+
+
+def cmd_users_search(args: argparse.Namespace) -> int:
+    with client(args) as http:
+        found = call(
+            http,
+            "GET",
+            f"/api/v1/idps/{quote(args.provider)}/users",
+            params={"q": args.query, "limit": args.limit},
+        )
+    if args.json:
+        print(json.dumps(found, indent=2))
+        return 0
+    rows: list[tuple[str, ...]] = [("USER NAME", "DISPLAY NAME", "EMAIL", "GROUPS")]
+    for u in found:
+        rows.append(
+            (
+                u["username"],
+                u.get("display_name") or "-",
+                u.get("email") or "-",
+                ",".join(u["groups"]) or "-",
+            )
+        )
+    print_table(rows)
+    return 0
+
+
+def cmd_users_import(args: argparse.Namespace) -> int:
+    body = {
+        "username": args.username,
+        "roles": split_values(args.role or []),
+        "access": access_from_args(args) or {},
+    }
+    with client(args) as http:
+        user = call(http, "POST", f"/api/v1/idps/{quote(args.provider)}/users", json=body)
+    print(f"{user['name']}: added from {args.provider} (reaches {describe_access(user['access'])})")
+    return 0
+
+
+def cmd_idps(args: argparse.Namespace) -> int:
+    with client(args) as http:
+        idps = call(http, "GET", "/api/v1/idps")
+    if args.json:
+        print(json.dumps(idps, indent=2))
+        return 0
+    if not idps:
+        print("no identity-provider modules are configured", file=sys.stderr)
+        return 0
+    rows: list[tuple[str, ...]] = [("ID", "NAME", "TYPE", "SIGN-IN", "DIRECTORY SEARCH")]
+    for p in idps:
+        rows.append((p["id"], p["name"], p["type"], p["login"], "yes" if p["can_search"] else "no"))
+    print_table(rows)
+    return 0
 
 
 def call(http: httpx.Client, method: str, path: str, **kwargs: Any) -> Any:
@@ -114,10 +551,9 @@ def call(http: httpx.Client, method: str, path: str, **kwargs: Any) -> Any:
     except httpx.HTTPError as exc:
         raise CliError(f"cannot reach SDL at {http.base_url}: {exc}") from exc
     if response.status_code >= 400:
-        try:
-            detail = response.json().get("detail", response.text)
-        except ValueError:
-            detail = response.text
+        detail = _message(_detail(response))
+        if response.status_code == 401:
+            detail += " (sign in again with 'sdl login')"
         raise CliError(f"{response.status_code}: {detail}")
     if response.status_code == 204:
         return None
@@ -593,9 +1029,133 @@ def build_parser() -> argparse.ArgumentParser:
     p = token.add_parser("new", help="generate a token and its config entry")
     p.add_argument("--id", required=True, help="client id recorded in the audit log")
     p.add_argument("--role", default="operator", choices=["admin", "operator", "auditor"])
+    p.add_argument("-g", "--group", action="append", help="limit the token to inventory groups")
+    p.add_argument("-s", "--system", action="append", help="limit the token to systems")
     p.set_defaults(func=cmd_token_new)
     p = token.add_parser("hash", help="print the SHA-256 of a token read from stdin")
     p.set_defaults(func=cmd_token_hash)
+
+    su = sub.add_parser(
+        "superuser", help="create or reset the superuser file (run on the SDL server)"
+    ).add_subparsers(dest="superuser_cmd", required=True)
+    p = su.add_parser("set", help="create the superuser, or change its name, password or TOTP")
+    p.add_argument("-f", "--file", required=True, help="path of identity.superuser_file")
+    p.add_argument("--name", help="superuser name (required when creating the file)")
+    p.add_argument("--display-name")
+    p.add_argument("--keep-password", action="store_true", help="only change the name or TOTP")
+    p.add_argument("--password-stdin", action="store_true", help="read the password from stdin")
+    p.add_argument("--min-length", type=int, default=12, help=argparse.SUPPRESS)
+    p.add_argument("--totp", action="store_true", help="set up (or replace) a TOTP authenticator")
+    p.add_argument("--no-totp", action="store_true", help="remove the TOTP authenticator")
+    p.set_defaults(func=cmd_superuser_set)
+    p = su.add_parser("show", help="show the superuser's name (never the password)")
+    p.add_argument("-f", "--file", required=True)
+    p.set_defaults(func=cmd_superuser_show)
+
+    p = sub.add_parser("login", help="sign in and keep the session for the next commands")
+    p.add_argument("-u", "--user", help="user name (asked when not given)")
+    p.add_argument("--provider", help="password identity provider, e.g. an LDAP module id")
+    p.add_argument("--sso", metavar="PROVIDER", help="sign in through a single sign-on provider")
+    p.add_argument("--code", help="TOTP code (asked when needed)")
+    p.add_argument("--password-stdin", action="store_true")
+    p.set_defaults(func=cmd_login)
+    p = sub.add_parser("logout", help="end the saved session")
+    p.set_defaults(func=cmd_logout)
+    p = sub.add_parser("whoami", help="show who you are signed in as and what you reach")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(func=cmd_whoami)
+    p = sub.add_parser("passwd", help="change your own password")
+    p.set_defaults(func=cmd_passwd)
+    mfa = sub.add_parser("mfa", help="multi-factor sign-in for your own account").add_subparsers(
+        dest="mfa_cmd", required=True
+    )
+    p = mfa.add_parser("setup", help="set up a TOTP authenticator app")
+    p.set_defaults(func=cmd_mfa_setup)
+
+    def access_options(p: argparse.ArgumentParser, *, changes: bool) -> None:
+        what = "replace the " if changes else ""
+        p.add_argument(
+            "-g", "--group", action="append", help=f"{what}inventory groups (repeatable, or a,b)"
+        )
+        p.add_argument(
+            "-s", "--system", action="append", help=f"{what}individual systems (repeatable)"
+        )
+        p.add_argument(
+            "--all-systems",
+            dest="all_systems",
+            action="store_true",
+            default=None,
+            help="reach every system",
+        )
+        if changes:
+            p.add_argument("--no-all-systems", dest="all_systems", action="store_false")
+            p.add_argument("--add-group", action="append")
+            p.add_argument("--remove-group", action="append")
+            p.add_argument("--add-system", action="append")
+            p.add_argument("--remove-system", action="append")
+
+    roles = "admin, operator, auditor"
+    users = sub.add_parser(
+        "users", help="manage users, their roles and assignments"
+    ).add_subparsers(dest="users_cmd", required=True)
+    p = users.add_parser("list", help="list users")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(func=cmd_users_list)
+    p = users.add_parser("show", help="show one user")
+    p.add_argument("name")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(func=cmd_users_show)
+    p = users.add_parser("add", help="add a local user")
+    p.add_argument("name")
+    p.add_argument("--display-name")
+    p.add_argument("--email")
+    p.add_argument("-r", "--role", action="append", help=f"role (repeatable): {roles}")
+    access_options(p, changes=False)
+    p.add_argument("--disabled", action="store_true", help="add the user disabled")
+    p.add_argument("--no-password", action="store_true", help="do not set a password yet")
+    p.add_argument("--password-stdin", action="store_true")
+    p.set_defaults(func=cmd_users_add)
+    p = users.add_parser("set", help="change a user's roles, groups, systems or details")
+    p.add_argument("name")
+    p.add_argument("--display-name")
+    p.add_argument("--email")
+    p.add_argument("-r", "--role", action="append", help=f"replace the roles: {roles}")
+    p.add_argument("--add-role", action="append")
+    p.add_argument("--remove-role", action="append")
+    access_options(p, changes=True)
+    p.add_argument("--enable", dest="enabled", action="store_true", default=None)
+    p.add_argument("--disable", dest="enabled", action="store_false")
+    p.set_defaults(func=cmd_users_set)
+    p = users.add_parser("remove", help="remove users")
+    p.add_argument("names", nargs="+")
+    p.set_defaults(func=cmd_users_remove)
+    p = users.add_parser("password", help="set a local user's password")
+    p.add_argument("name")
+    p.add_argument("--permanent", action="store_true", help="do not make them change it")
+    p.add_argument("--password-stdin", action="store_true")
+    p.set_defaults(func=cmd_users_password)
+    p = users.add_parser("reset-mfa", help="remove a user's authenticator (lost device)")
+    p.add_argument("name")
+    p.set_defaults(func=cmd_users_reset_mfa)
+    p = users.add_parser("unlock", help="clear a lockout after failed sign-ins")
+    p.add_argument("name")
+    p.set_defaults(func=cmd_users_unlock)
+    p = users.add_parser("search", help="look users up in a directory (LDAP / AD)")
+    p.add_argument("provider", help="identity provider id")
+    p.add_argument("query", nargs="?", default="")
+    p.add_argument("--limit", type=int, default=50)
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(func=cmd_users_search)
+    p = users.add_parser("import", help="add a directory user before their first sign-in")
+    p.add_argument("provider", help="identity provider id")
+    p.add_argument("username")
+    p.add_argument("-r", "--role", action="append", help=f"extra roles: {roles}")
+    access_options(p, changes=False)
+    p.set_defaults(func=cmd_users_import)
+
+    p = sub.add_parser("idps", help="list identity providers (LDAP / AD, Entra ID, SAML...)")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(func=cmd_idps)
 
     rollover = sub.add_parser("rollover", help="run and inspect rollovers").add_subparsers(
         dest="rollover_cmd", required=True
@@ -720,6 +1280,9 @@ def main(argv: list[str] | None = None) -> int:
     try:
         return int(args.func(args))
     except CliError as exc:
+        print(f"sdl: {exc}", file=sys.stderr)
+        return 2
+    except ValueError as exc:  # superuser file problems, among others
         print(f"sdl: {exc}", file=sys.stderr)
         return 2
 

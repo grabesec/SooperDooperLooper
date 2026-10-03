@@ -20,6 +20,7 @@ classifiers = [
     "Topic :: System :: Systems Administration",
 ]
 dependencies = [
+    "argon2-cffi>=23.1",
     "asyncssh>=2.14",
     "fastapi>=0.110",
     "httpx>=0.27",
@@ -29,7 +30,13 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+# Identity providers: LDAP / Active Directory, OpenID Connect (Entra ID...), SAML.
+ldap = ["ldap3>=2.9"]
+oidc = ["pyjwt[crypto]>=2.8"]
+saml = ["signxml>=4.0", "lxml>=5.0"]
 dev = [
+    "sooperdooperlooper[ldap,oidc,saml]",
+    "lxml-stubs",
     "mypy>=1.10",
     "pytest>=8.0",
     "pytest-asyncio>=0.23",
@@ -49,10 +56,14 @@ sdl = "sdl.cli.main:main"
 "forwarder.splunk_hec" = "sdl.modules.forwarder_splunk_hec:SplunkHecForwarderModule"
 "forwarder.syslog" = "sdl.modules.forwarder_syslog:SyslogForwarderModule"
 "generator.password" = "sdl.modules.generator_password:PasswordGeneratorModule"
+"idp.ldap" = "sdl.modules.idp_ldap:LdapIdentityProvider"
+"idp.oidc" = "sdl.modules.idp_oidc:OidcIdentityProvider"
+"idp.saml" = "sdl.modules.idp_saml:SamlIdentityProvider"
 "inventory.netbox" = "sdl.modules.inventory_netbox:NetBoxInventoryModule"
 "inventory.store" = "sdl.modules.inventory_store:StoreInventoryModule"
 "secrets.vault" = "sdl.modules.secrets_vault:VaultKV2SecretsModule"
 "target.ssh_linux" = "sdl.modules.target_ssh_linux:SshLinuxTargetModule"
+"users.store" = "sdl.modules.users_store:StoreUsersModule"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/sdl"]
@@ -89,5 +100,5 @@ mypy_path = "src"
 disable_error_code = ["type-abstract"]
 
 [[tool.mypy.overrides]]
-module = ["asyncssh.*"]
+module = ["asyncssh.*", "ldap3.*", "signxml.*"]
 ignore_missing_imports = true

@@ -97,11 +97,12 @@ class JsonlAuditModule(AuditModule):
         async with self._lock:
             return await asyncio.to_thread(scan)
 
-    async def facets(self) -> AuditFacets:
+    async def facets(self, query: AuditQuery | None = None) -> AuditFacets:
         def scan() -> AuditFacets:
             facets = AuditFacets()
             for event in self._iter():
-                facets.add(event)
+                if query is None or query.matches(event):
+                    facets.add(event)
             return facets
 
         async with self._lock:
