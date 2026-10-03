@@ -1,8 +1,12 @@
 """Rolls over a local account password on Linux hosts over SSH.
 
-SDL signs in with a dedicated service account (SSH key auth), changes the
-password with ``chpasswd`` through sudo, and verifies the new password by
-authenticating as the account with ``su`` (or a fresh SSH password login).
+SDL signs in with a dedicated service account, changes the password with
+``chpasswd`` through sudo, and verifies the new password by authenticating as
+the account with ``su`` (or a fresh SSH password login).
+
+The service account is either the one in this module's configuration (a key
+file on the SDL server) or, per system, the ``service_account`` the inventory
+names, whose SSH key or password SDL reads from a secrets module.
 
 Recommended sudoers entry for the service account, which grants nothing
 except changing passwords::
@@ -22,7 +26,7 @@ from typing import Any, Literal
 import asyncssh
 from pydantic import Field, SecretStr
 
-from sdl.core.models import TargetSpec
+from sdl.core.models import ServiceCredential, TargetSpec
 from sdl.core.module import ModuleConfig, ModuleError, TargetModule, TargetSession
 
 _ACCOUNT_RE = re.compile(r"^[a-z_][a-z0-9_.-]{0,31}\$?$", re.I)
@@ -33,8 +37,13 @@ _VERIFY_COMMAND = "printf 'SDL%sOK\\n' -VERIFY-"
 
 
 class SshLinuxConfig(ModuleConfig):
-    username: str = Field(description="SSH service account SDL signs in as.")
-    private_key_path: Path = Field(description="Private key for the service account.")
+    username: str | None = Field(
+        default=None,
+        description="Default SSH service account, for systems that do not name their own.",
+    )
+    private_key_path: Path | None = Field(
+        default=None, description="Private key for the default service account."
+    )
     private_key_passphrase_env: str | None = Field(
         default=None, description="Env var holding the private key's passphrase, if any."
     )
@@ -71,53 +80,87 @@ class SshLinuxTargetModule(TargetModule):
             return str(self.config.known_hosts_path)
         return ()  # asyncssh default: ~/.ssh/known_hosts
 
-    def _client_key(self) -> Any:
-        passphrase = None
+    def _passphrase(self) -> str | None:
         if self.config.private_key_passphrase_env:
-            passphrase = os.environ.get(self.config.private_key_passphrase_env)
-        try:
-            return asyncssh.read_private_key(str(self.config.private_key_path), passphrase)
-        except (OSError, asyncssh.KeyImportError) as exc:
-            raise ModuleError(
-                f"cannot load private key {self.config.private_key_path}: {exc}"
-            ) from exc
+            return os.environ.get(self.config.private_key_passphrase_env)
+        return None
 
-    async def open_session(self, target: TargetSpec) -> TargetSession:
+    def _client_key(self, path: Path) -> Any:
+        try:
+            return asyncssh.read_private_key(str(path), self._passphrase())
+        except (OSError, asyncssh.KeyImportError) as exc:
+            raise ModuleError(f"cannot load private key {path}: {exc}") from exc
+
+    def _login(self, credential: ServiceCredential | None) -> tuple[str, dict[str, Any]]:
+        """The service account's username and the asyncssh options to sign in with it."""
+        if credential is not None:
+            if credential.credential_type == "password":
+                return credential.username, {
+                    "password": credential.secret.get_secret_value(),
+                    "client_keys": None,
+                    "preferred_auth": "password,keyboard-interactive",
+                }
+            try:
+                key = asyncssh.import_private_key(
+                    credential.secret.get_secret_value(), self._passphrase()
+                )
+            except (asyncssh.KeyImportError, ValueError) as exc:
+                raise ModuleError(
+                    f"the SSH key stored for service account {credential.username!r} "
+                    f"cannot be loaded: {exc}"
+                ) from exc
+            return credential.username, {"client_keys": [key], "password": None}
+        if self.config.username is None or self.config.private_key_path is None:
+            raise ModuleError(
+                "no service account: give the system a service_account, or set username and "
+                f"private_key_path in the {self.instance_id!r} module configuration"
+            )
+        return self.config.username, {
+            "client_keys": [self._client_key(self.config.private_key_path)],
+            "password": None,
+        }
+
+    async def open_session(
+        self, target: TargetSpec, credential: ServiceCredential | None = None
+    ) -> TargetSession:
         if not _ACCOUNT_RE.match(target.account):
             raise ModuleError(f"invalid account name {target.account!r}")
+        username, login = self._login(credential)
         try:
             conn = await asyncio.wait_for(
                 asyncssh.connect(
                     target.host,
                     port=target.port,
-                    username=self.config.username,
-                    client_keys=[self._client_key()],
+                    username=username,
                     known_hosts=self._known_hosts(),
                     agent_path=None,
-                    password=None,
                     connect_timeout=self.config.connect_timeout,
+                    **login,
                 ),
                 self.config.connect_timeout + 5,
             )
         except asyncssh.HostKeyNotVerifiable as exc:
             raise ModuleError(f"host key for {target.host} is not trusted: {exc}") from exc
         except asyncssh.PermissionDenied as exc:
-            raise ModuleError(
-                f"{target.host} rejected the service account {self.config.username!r}"
-            ) from exc
+            raise ModuleError(f"{target.host} rejected the service account {username!r}") from exc
         except (OSError, asyncssh.Error, TimeoutError) as exc:
             raise ModuleError(f"cannot connect to {target.host}:{target.port}: {exc}") from exc
-        return SshLinuxSession(self, target, conn)
+        return SshLinuxSession(self, target, conn, username)
 
 
 class SshLinuxSession(TargetSession):
     def __init__(
-        self, module: SshLinuxTargetModule, target: TargetSpec, conn: asyncssh.SSHClientConnection
+        self,
+        module: SshLinuxTargetModule,
+        target: TargetSpec,
+        conn: asyncssh.SSHClientConnection,
+        username: str,
     ) -> None:
         self.module = module
         self.config = module.config
         self.target = target
         self.conn = conn
+        self.username = username
 
     async def close(self) -> None:
         self.conn.close()
@@ -142,7 +185,7 @@ class SshLinuxSession(TargetSession):
         if result.exit_status != 0:
             raise ModuleError("could not run commands as the service account")
         service_uid = str(result.stdout).strip()
-        notes.append(f"signed in as {self.config.username} (uid {service_uid})")
+        notes.append(f"signed in as {self.username} (uid {service_uid})")
 
         result = await self._run(f"getent passwd {shlex.quote(self.target.account)}")
         if result.exit_status != 0:
@@ -152,7 +195,7 @@ class SshLinuxSession(TargetSession):
             result = await self._run(f"sudo -n -l {shlex.quote(self.config.chpasswd_path)}")
             if result.exit_status != 0:
                 raise ModuleError(
-                    f"{self.config.username} may not run {self.config.chpasswd_path} with "
+                    f"{self.username} may not run {self.config.chpasswd_path} with "
                     "passwordless sudo"
                 )
             notes.append(f"sudo allows {self.config.chpasswd_path}")

@@ -109,6 +109,15 @@ def environment(tmp_path_factory: pytest.TempPathFactory) -> Iterator[dict[str, 
         known_hosts = [wait_for(lambda p=p: host_key_line(p), f"sshd on {p}") for p in VMS.values()]
         (work / "known_hosts").write_text("\n".join(known_hosts) + "\n")
 
+        # The service account's SSH key, for systems kept in SDL's inventory: SDL
+        # reads it from Vault instead of a key file on its own disk.
+        pem = (work / "id_ed25519").read_text()
+        httpx.post(
+            f"{VAULT_URL}/v1/secret/data/sdl/svc/sdl-svc",
+            headers={"X-Vault-Token": VAULT_TOKEN},
+            json={"data": {"password": pem}},
+        ).raise_for_status()
+
         for name in ("vm1", "vm2"):  # vm3 starts with no stored password
             httpx.post(
                 f"{VAULT_URL}/v1/secret/data/sdl/linux/{name}/root",
@@ -137,6 +146,10 @@ def environment(tmp_path_factory: pytest.TempPathFactory) -> Iterator[dict[str, 
                     },
                 },
                 "passwords": {"type": "generator.password"},
+                "inventory": {
+                    "type": "inventory.store",
+                    "config": {"path": str(work / "inventory.json")},
+                },
                 "vault": {"type": "secrets.vault", "config": {"url": VAULT_URL}},
                 "linux_su": {
                     "type": "target.ssh_linux",
@@ -306,3 +319,59 @@ def test_verification_rejects_wrong_password(environment: dict[str, Any], method
             return right, wrong
 
     assert asyncio.run(check()) == (True, False)
+
+
+def test_inventory_systems_with_service_account_from_vault(environment: dict[str, Any]) -> None:
+    """Second user story: store systems in SDL's inventory, pick some, see each result.
+
+    lab-a and lab-b live in the built-in inventory (not in sdl.yaml), point at
+    vm1 and vm3 by IP, and sign in with the service account key kept in Vault.
+    """
+    for name, vm in (("lab-a", "vm1"), ("lab-b", "vm3")):
+        added = sdl(
+            environment,
+            "systems", "add", name,
+            "--inventory", "inventory",
+            "--hostname", vm,
+            "--fqdn", f"{vm}.lab.example.com",
+            "--ip", "127.0.0.1",
+            "--host", "127.0.0.1",
+            "--port", str(VMS[vm]),
+            "--module", "linux_su",
+            "--secret-path", f"linux/{vm}/root",
+            "--service-account", "sdl-svc",
+            "--service-account-path", "svc/sdl-svc",
+            "-g", "inventory-lab",
+        )  # fmt: skip
+        assert added.returncode == 0, added.stdout + added.stderr
+
+    listed = json.loads(
+        sdl(environment, "systems", "list", "--source", "inventory", "--json").stdout
+    )
+    assert [(s["name"], s["fqdn"]) for s in listed] == [
+        ("lab-a", "vm1.lab.example.com"),
+        ("lab-b", "vm3.lab.example.com"),
+    ]
+
+    before = vault_read("linux/vm1/root")
+    assert before is not None
+    result = sdl(
+        environment, "rollover", "run", "-t", "lab-a", "-t", "lab-b", "-r", "inventory", "--json"
+    )
+    run = json.loads(result.stdout)
+    results = {r["target"]: r for r in run["results"]}
+    assert results["lab-a"]["status"] == "succeeded", results["lab-a"]
+    assert results["lab-a"]["source"] == "inventory"
+    steps = [s["name"] for s in results["lab-a"]["steps"]]
+    assert steps[:3] == ["start", "service_account", "connect"]
+    # vm3's service account has no sudo rule: signed in with the Vault key, then stopped.
+    assert results["lab-b"]["status"] == "failed"
+    assert "sudo" in results["lab-b"]["message"]
+
+    after = vault_read("linux/vm1/root")
+    assert after is not None and after["metadata"]["version"] == before["metadata"]["version"] + 1
+    assert root_login_works(VMS["vm1"], after["data"]["password"])
+    assert root_login_works(VMS["vm3"], INITIAL_PASSWORD)
+
+    log_text = (environment["work"] / "audit.jsonl").read_text()
+    assert "PRIVATE KEY" not in log_text

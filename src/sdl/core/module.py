@@ -24,7 +24,7 @@ from typing import TYPE_CHECKING, Any, ClassVar
 
 from pydantic import BaseModel, ConfigDict, SecretStr
 
-from sdl.core.models import Actor, AuditEvent, SecretRecord, TargetSpec
+from sdl.core.models import Actor, AuditEvent, SecretRecord, ServiceCredential, TargetSpec
 
 if TYPE_CHECKING:
     from fastapi import APIRouter, Request
@@ -36,6 +36,7 @@ class ModuleKind(StrEnum):
     AUDIT = "audit"
     AUTH = "auth"
     GENERATOR = "generator"
+    INVENTORY = "inventory"
     SECRETS = "secrets"
     TARGET = "target"
 
@@ -122,6 +123,35 @@ class GeneratorModule(Module):
     def generate(self, target: TargetSpec) -> SecretStr: ...
 
 
+class InventoryModule(Module):
+    """A source of systems to roll over: SDL's own store, NetBox, a CMDB, ...
+
+    The core merges every inventory module's systems into one list. A system's
+    name must be unique across inventories; when two inventories hold the same
+    name, the one configured first wins and the other is reported as skipped.
+    Read-only sources keep ``writable = False``; writable ones also implement
+    ``put_system`` and ``delete_system``.
+    """
+
+    kind = ModuleKind.INVENTORY
+    writable: ClassVar[bool] = False
+
+    @abstractmethod
+    async def list_systems(self) -> list[TargetSpec]:
+        """Return every system this inventory holds."""
+
+    async def refresh(self) -> None:
+        """Drop any cached data so the next ``list_systems`` reads the source again."""
+
+    async def put_system(self, system: TargetSpec) -> None:
+        """Add the system, or replace the one with the same name."""
+        raise ModuleError(f"inventory {self.instance_id!r} is read-only")
+
+    async def delete_system(self, name: str) -> bool:
+        """Remove the system; return False when there is none with that name."""
+        raise ModuleError(f"inventory {self.instance_id!r} is read-only")
+
+
 class SecretsModule(Module):
     """A connector to a secret manager (HashiCorp Vault, Bitwarden, ...)."""
 
@@ -168,7 +198,15 @@ class TargetModule(Module):
     kind = ModuleKind.TARGET
 
     @abstractmethod
-    async def open_session(self, target: TargetSpec) -> TargetSession: ...
+    async def open_session(
+        self, target: TargetSpec, credential: ServiceCredential | None = None
+    ) -> TargetSession:
+        """Connect to the target.
+
+        ``credential`` is the system's service account, read from the secrets
+        module, when the system names one; otherwise the module signs in with
+        its own configured account.
+        """
 
 
 class ModuleError(Exception):

@@ -1,0 +1,123 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SDL Rollovers</title>
+<link rel="stylesheet" href="/ui/app.css">
+<script src="/ui/app.js" defer></script>
+</head>
+<body>
+<header class="bar">
+  <h1>SooperDooperLooper</h1>
+  <div id="who" class="who" hidden>
+    <span id="who-name"></span>
+    <button id="sign-out" type="button" class="link">Sign out</button>
+  </div>
+</header>
+
+<main>
+  <section id="signin" class="card narrow" hidden>
+    <h2>Sign in</h2>
+    <p class="muted">Paste your SDL API token. It is kept in this browser tab only.</p>
+    <form id="signin-form">
+      <label>API token <input id="token" type="password" autocomplete="off" required></label>
+      <button type="submit">Sign in</button>
+      <p id="signin-error" class="error" role="alert"></p>
+    </form>
+  </section>
+
+  <div id="app" hidden>
+    <section class="card">
+      <div class="section-head">
+        <h2>Systems</h2>
+        <div class="tools">
+          <input id="filter" type="search" placeholder="Filter by name, FQDN, IP, group">
+          <select id="group-filter" aria-label="Group"><option value="">All groups</option></select>
+          <select id="source-filter" aria-label="Inventory"><option value="">All inventories</option></select>
+          <button id="refresh" type="button" class="secondary">Refresh inventory</button>
+          <button id="add-system" type="button" class="secondary" hidden>Add system</button>
+        </div>
+      </div>
+      <div id="inventory-notes"></div>
+      <div class="table-wrap">
+        <table id="systems">
+          <thead>
+            <tr>
+              <th class="check"><input id="select-all" type="checkbox" aria-label="Select all shown"></th>
+              <th>Name</th><th>Hostname</th><th>FQDN</th><th>IP addresses</th>
+              <th>Account</th><th>Service account</th><th>Groups</th><th>Inventory</th><th></th>
+            </tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+      </div>
+      <p id="systems-empty" class="muted" hidden>No systems match.</p>
+    </section>
+
+    <section class="card">
+      <h2>Roll over</h2>
+      <form id="run-form" class="run-form">
+        <p><strong id="selected-count">0 systems selected</strong></p>
+        <label class="grow">Reason (recorded in the audit log)
+          <input id="reason" type="text" maxlength="500" required placeholder="e.g. quarterly rotation">
+        </label>
+        <label class="inline"><input id="dry-run" type="checkbox"> Dry run (checks only, changes nothing)</label>
+        <button id="run" type="submit" disabled>Roll over</button>
+        <p id="run-error" class="error" role="alert"></p>
+      </form>
+    </section>
+
+    <section id="result" class="card" hidden>
+      <div class="section-head">
+        <h2 id="result-title">Run</h2>
+        <span id="result-status" class="badge"></span>
+      </div>
+      <p id="result-meta" class="muted"></p>
+      <div class="table-wrap">
+        <table id="results">
+          <thead><tr><th>System</th><th>Host</th><th>Account</th><th>Status</th><th>Version</th><th>Detail</th></tr></thead>
+          <tbody></tbody>
+        </table>
+      </div>
+    </section>
+
+    <section id="history" class="card" hidden>
+      <h2>Recent runs</h2>
+      <ul id="runs" class="runs"></ul>
+    </section>
+  </div>
+</main>
+
+<dialog id="system-dialog">
+  <form id="system-form" method="dialog">
+    <h2 id="system-dialog-title">Add system</h2>
+    <div class="grid">
+      <label>Inventory <select id="f-inventory" required></select></label>
+      <label>Name <input id="f-name" required pattern="[A-Za-z0-9][A-Za-z0-9_.:\-]*"></label>
+      <label>Hostname <input id="f-hostname"></label>
+      <label>FQDN <input id="f-fqdn"></label>
+      <label>IP addresses <input id="f-addresses" placeholder="10.0.0.5, 2001:db8::5"></label>
+      <label>Connect to <input id="f-host" placeholder="defaults to FQDN, then IP"></label>
+      <label>SSH port <input id="f-port" type="number" min="1" max="65535" value="22"></label>
+      <label>Account to roll over <input id="f-account" value="root" required></label>
+      <label>Secret path <input id="f-secret-path" required placeholder="linux/web1/root"></label>
+      <label>Target module <input id="f-module" placeholder="default"></label>
+      <label>Service account <input id="f-sa-user" placeholder="default from module"></label>
+      <label>Service account credential path <input id="f-sa-path" placeholder="svc/web1/sdl-svc"></label>
+      <label>Credential type
+        <select id="f-sa-type"><option value="ssh_key">SSH private key</option><option value="password">Password</option></select>
+      </label>
+      <label>Groups <input id="f-groups" placeholder="web, prod"></label>
+      <label class="wide">Description <input id="f-description"></label>
+    </div>
+    <p class="muted">Credentials are never entered here: the secret paths point into the secrets module.</p>
+    <p id="system-error" class="error" role="alert"></p>
+    <div class="actions">
+      <button id="system-cancel" type="button" class="secondary">Cancel</button>
+      <button type="submit">Save</button>
+    </div>
+  </form>
+</dialog>
+</body>
+</html>

@@ -6,7 +6,7 @@ from typing import Any
 import pytest
 from pydantic import Field, SecretStr
 
-from sdl.core.models import SecretRecord, TargetSpec
+from sdl.core.models import SecretRecord, ServiceCredential, TargetSpec
 from sdl.core.module import ModuleConfig, ModuleError, SecretsModule, TargetModule, TargetSession
 from sdl.core.orchestrator import Orchestrator
 from sdl.core.registry import ModuleRegistry
@@ -24,6 +24,7 @@ class FakeHosts:
     def __init__(self) -> None:
         self.passwords: dict[str, str] = {}
         self.change_calls: dict[str, int] = {}
+        self.logins: list[tuple[str, str, str]] = []
 
 
 HOSTS = FakeHosts()
@@ -58,7 +59,14 @@ class FakeTargetSession(TargetSession):
 
 
 class FakeTargetModule(TargetModule):
-    async def open_session(self, target: TargetSpec) -> TargetSession:
+    async def open_session(
+        self, target: TargetSpec, credential: ServiceCredential | None = None
+    ) -> TargetSession:
+        if credential is not None:
+            HOSTS.logins.append((target.host, credential.username, credential.credential_type))
+            expected = target.options.get("service_secret")
+            if expected is not None and credential.secret.get_secret_value() != expected:
+                raise ModuleError(f"{target.host} rejected the service account")
         if target.options.get("fail_connect"):
             raise ModuleError(f"cannot connect to {target.host}:22: Connection refused")
         return FakeTargetSession(target)
@@ -105,6 +113,7 @@ def make_settings(
     tmp_path: Path,
     targets: list[dict[str, Any]] | None = None,
     secrets_config: dict[str, Any] | None = None,
+    extra_modules: dict[str, Any] | None = None,
 ) -> Settings:
     if targets is None:
         targets = [
@@ -141,6 +150,7 @@ def make_settings(
                 "passwords": {"type": "generator.password", "config": {"length": 24}},
                 "vault": {"type": "secrets.fake", "config": secrets_config or {}},
                 "linux": {"type": "target.fake"},
+                **(extra_modules or {}),
             },
             "targets": [
                 {"module": "linux", "secret_path": f"linux/{t['name']}/root", **t} for t in targets
@@ -153,6 +163,7 @@ def make_settings(
 def _reset_hosts() -> None:
     HOSTS.passwords.clear()
     HOSTS.change_calls.clear()
+    HOSTS.logins.clear()
 
 
 @pytest.fixture

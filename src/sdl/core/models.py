@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
+import ipaddress
 import uuid
 from datetime import UTC, datetime
 from enum import StrEnum
-from typing import Any
+from typing import Any, Literal
 
-from pydantic import BaseModel, Field, SecretStr
+from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator, model_validator
 
 
 def utcnow() -> datetime:
@@ -67,20 +68,105 @@ class AuditEvent(BaseModel):
     hash: str | None = None
 
 
-class TargetSpec(BaseModel):
-    """A system whose credential SDL rolls over (for example, root on a Linux VM)."""
+class ServiceAccount(BaseModel):
+    """The account SDL signs in to a system with to perform the rollover.
 
-    name: str
-    host: str
-    port: int = 22
-    module: str = Field(description="Instance id of the target module that manages this target.")
-    account: str = "root"
-    secret_path: str = Field(description="Where the credential lives in the secrets module.")
+    Only a reference is kept here: the credential itself (an SSH private key or
+    a password) lives in a secrets module, at ``credential_path``.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    username: str = Field(min_length=1)
+    credential_path: str = Field(
+        min_length=1, description="Where the account's credential lives in the secrets module."
+    )
+    credential_type: Literal["ssh_key", "password"] = "ssh_key"
     secrets: str | None = Field(
         default=None, description="Secrets module instance id; defaults to the only one configured."
     )
+
+
+class ServiceCredential(BaseModel):
+    """A service account with its credential, as handed to a target module for one session."""
+
+    username: str
+    credential_type: Literal["ssh_key", "password"]
+    secret: SecretStr
+
+
+class TargetSpec(BaseModel):
+    """A system whose credential SDL rolls over (for example, root on a Linux VM).
+
+    Systems come from inventory modules (and from ``targets:`` in sdl.yaml).
+    ``host`` is the address SDL connects to; when it is not given it is taken
+    from the FQDN, then the first IP address, then the hostname.
+    """
+
+    name: str = Field(min_length=1, max_length=255, pattern=r"^[A-Za-z0-9][A-Za-z0-9_.:-]*$")
+    hostname: str | None = None
+    fqdn: str | None = None
+    addresses: list[str] = Field(default_factory=list, description="IP addresses.")
+    host: str = Field(default="", description="Address to connect to; derived when empty.")
+    port: int = Field(default=22, ge=1, le=65535)
+    module: str | None = Field(
+        default=None,
+        description="Instance id of the target module that manages this system; "
+        "defaults to the only one configured.",
+    )
+    account: str = "root"
+    secret_path: str = Field(
+        min_length=1, description="Where the credential lives in the secrets module."
+    )
+    secrets: str | None = Field(
+        default=None, description="Secrets module instance id; defaults to the only one configured."
+    )
+    service_account: ServiceAccount | None = Field(
+        default=None,
+        description="Account SDL signs in with; defaults to the target module's own settings.",
+    )
     groups: list[str] = Field(default_factory=list)
+    description: str | None = None
     options: dict[str, Any] = Field(default_factory=dict)
+    source: str | None = Field(
+        default=None, description="Inventory the system came from; set by SDL."
+    )
+
+    @field_validator("addresses")
+    @classmethod
+    def _valid_addresses(cls, value: list[str]) -> list[str]:
+        return [str(ipaddress.ip_address(a.strip())) for a in value]
+
+    @model_validator(mode="after")
+    def _derive_host(self) -> TargetSpec:
+        if not self.host:
+            host = self.fqdn or (self.addresses[0] if self.addresses else None) or self.hostname
+            if not host:
+                raise ValueError("a system needs a host, an FQDN, an IP address or a hostname")
+            self.host = host
+        return self
+
+
+class InventorySource(BaseModel):
+    """One inventory as seen by the core: where systems came from and whether it answered."""
+
+    id: str
+    type: str
+    writable: bool = False
+    ok: bool = True
+    error: str | None = None
+    systems: int = 0
+    skipped: list[str] = Field(
+        default_factory=list,
+        description="Systems not listed because an earlier inventory has the same name.",
+    )
+
+
+class Inventory(BaseModel):
+    """Every system SDL knows, merged from all inventories."""
+
+    systems: list[TargetSpec] = Field(default_factory=list)
+    sources: list[InventorySource] = Field(default_factory=list)
 
 
 class SecretRecord(BaseModel):
@@ -117,6 +203,7 @@ class TargetResult(BaseModel):
     target: str
     host: str
     account: str
+    source: str | None = None
     status: TargetStatus = TargetStatus.PENDING
     message: str | None = None
     secret_path: str

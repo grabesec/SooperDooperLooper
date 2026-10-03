@@ -1,7 +1,8 @@
 # What happens during a rollover
 
-`sdl rollover run` (or `POST /api/v1/rollovers`) selects targets by name,
-group, or `--all`, and requires a reason, which goes into the audit log. Up to
+`sdl rollover run` (or `POST /api/v1/rollovers`, or the web page) selects
+systems from the inventory ([inventory.md](inventory.md)) by name, group, or
+`--all`, and requires a reason, which goes into the audit log. Up to
 `rollover.max_parallel` targets are processed at once, and a target can only
 be in one run at a time.
 
@@ -10,7 +11,8 @@ audit log and in the target's report. Credentials never appear in either.
 
 | Step            | What happens                                                                 | If it fails                         |
 |-----------------|------------------------------------------------------------------------------|-------------------------------------|
-| `connect`       | SSH to the VM as the service account, with key auth and strict host key checking | **failed**, nothing changed        |
+| `service_account` | Only for systems that name a service account: read its SSH key or password from the secrets module | **failed**, nothing changed        |
+| `connect`       | SSH to the VM as the service account, with strict host key checking           | **failed**, nothing changed        |
 | `preflight`     | Service account works, account exists, sudo allows `chpasswd`, verifier available | **failed**, nothing changed        |
 | `read_previous` | Read the current password from Vault (kept for rollback)                      | **failed**, nothing changed        |
 | `generate`      | Generate a new password from the configured policy                            |                                     |

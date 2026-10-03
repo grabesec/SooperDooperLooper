@@ -19,6 +19,24 @@ modules:
           token_sha256: "0000000000000000000000000000000000000000000000000000000000000000"
           roles: [admin]
 
+  # SDL's own inventory of systems (hostnames, FQDNs, IPs, service accounts).
+  # Add systems with `sdl systems add ... --inventory inventory` or on the web page.
+  inventory:
+    type: inventory.store
+    config:
+      path: /var/lib/sdl/inventory.json
+
+  # Systems can also come from NetBox (read-only). See docs/inventory.md.
+  # netbox:
+  #   type: inventory.netbox
+  #   config:
+  #     url: https://netbox.example.com
+  #     token_env: NETBOX_TOKEN
+  #     filters: {status: active, tag: sdl}
+  #     defaults:
+  #       secret_path: "linux/{name}/{account}"
+  #       service_account: {username: sdl-svc, credential_path: "svc/sdl-svc"}
+
   passwords:
     type: generator.password
     config:
@@ -36,11 +54,14 @@ modules:
   linux:
     type: target.ssh_linux
     config:
+      # Default service account, for systems that do not name one whose key
+      # is kept in the secrets module.
       username: sdl-svc
       private_key_path: /etc/sdl/ssh/id_ed25519
       known_hosts_path: /etc/sdl/ssh/known_hosts
       verify_method: su      # or ssh_login
 
+# Systems can also be listed right here; they show up as inventory "sdl.yaml".
 targets:
   - name: web1
     host: 10.0.0.11

@@ -14,6 +14,8 @@ from typing import TypeVar
 from sdl.core.audit import AuditRecorder
 from sdl.core.models import (
     Actor,
+    Inventory,
+    InventorySource,
     Outcome,
     RolloverRequest,
     RolloverRun,
@@ -27,6 +29,7 @@ from sdl.core.module import (
     AuditModule,
     AuthModule,
     GeneratorModule,
+    InventoryModule,
     Module,
     ModuleContext,
     SecretsModule,
@@ -41,12 +44,24 @@ log = logging.getLogger("sdl.orchestrator")
 M = TypeVar("M", bound=Module)
 
 
+CONFIG_INVENTORY = "sdl.yaml"
+"""Inventory id of the systems listed under ``targets:`` in the configuration file."""
+
+
 class ConfigError(ValueError):
     pass
 
 
 class RequestError(ValueError):
     """The caller asked for something that cannot be done (unknown target, busy target...)."""
+
+
+class NotFoundError(RequestError):
+    """The caller named a system or inventory that does not exist."""
+
+
+class ConflictError(RequestError):
+    """The request clashes with the current state (a busy system, a duplicate name...)."""
 
 
 class Orchestrator:
@@ -93,7 +108,8 @@ class Orchestrator:
             Outcome.SUCCESS,
             message="SDL started",
             modules={i: type(m).__name__ for i, m in self.modules.items()},
-            targets=len(self.settings.targets),
+            config_targets=len(self.settings.targets),
+            inventories=[m.instance_id for m in self.all_of(InventoryModule)],
         )
 
     async def stop(self) -> None:
@@ -119,10 +135,13 @@ class Orchestrator:
         self._started = False
 
     def _validate(self) -> None:
+        if CONFIG_INVENTORY in self.modules:
+            raise ConfigError(f"{CONFIG_INVENTORY!r} is reserved and cannot be a module id")
         for target in self.settings.targets:
-            self._target_module(target)
-            self._secrets_module(target)
-        if self.settings.targets:
+            problems = self.check_system(target)
+            if problems:
+                raise ConfigError(f"target {target.name!r}: {'; '.join(problems)}")
+        if self.settings.targets or self.all_of(InventoryModule):
             self.one_of(GeneratorModule, self.settings.rollover.generator)
 
     # -- module lookup -------------------------------------------------------
@@ -147,56 +166,220 @@ class Orchestrator:
     def auth_module(self) -> AuthModule:
         return self.one_of(AuthModule, self.settings.api.auth)
 
+    def check_system(self, system: TargetSpec) -> list[str]:
+        """Return what stops ``system`` from being rolled over with the configured modules."""
+        problems: list[str] = []
+        lookups: list[tuple[type[Module], str | None]] = [
+            (TargetModule, system.module),
+            (SecretsModule, system.secrets),
+        ]
+        if system.service_account is not None:
+            lookups.append((SecretsModule, system.service_account.secrets))
+        for kind, instance_id in lookups:
+            try:
+                self.one_of(kind, instance_id)
+            except ConfigError as exc:
+                problems.append(str(exc))
+        return problems
+
     def _target_module(self, target: TargetSpec) -> TargetModule:
         try:
             return self.one_of(TargetModule, target.module)
         except ConfigError as exc:
             raise ConfigError(f"target {target.name!r}: {exc}") from exc
 
-    def _secrets_module(self, target: TargetSpec) -> SecretsModule:
+    def _secrets_module(self, target: TargetSpec, instance_id: str | None = None) -> SecretsModule:
         try:
-            return self.one_of(SecretsModule, target.secrets)
+            return self.one_of(SecretsModule, instance_id or target.secrets)
         except ConfigError as exc:
             raise ConfigError(f"target {target.name!r}: {exc}") from exc
 
-    # -- targets -------------------------------------------------------------
+    def _service_secrets(self, target: TargetSpec) -> SecretsModule | None:
+        if target.service_account is None:
+            return None
+        return self._secrets_module(target, target.service_account.secrets)
+
+    # -- inventory -----------------------------------------------------------
 
     @property
     def targets(self) -> list[TargetSpec]:
-        return list(self.settings.targets)
+        """Systems listed under ``targets:`` in the configuration file."""
+        return [t.model_copy(update={"source": CONFIG_INVENTORY}) for t in self.settings.targets]
 
-    def select_targets(self, request: RolloverRequest) -> list[TargetSpec]:
-        by_name = {t.name: t for t in self.settings.targets}
+    def inventory_module(self, instance_id: str) -> InventoryModule:
+        module = self.modules.get(instance_id)
+        if not isinstance(module, InventoryModule):
+            raise NotFoundError(f"no inventory named {instance_id!r}")
+        return module
+
+    async def inventory(self) -> Inventory:
+        """Every system from every inventory, the configuration file's first.
+
+        An inventory that fails or times out is reported in ``sources`` and the
+        others are still listed, so one unreachable NetBox does not block
+        rollovers of systems kept elsewhere.
+        """
+        modules = self.all_of(InventoryModule)
+        timeout = self.settings.inventory.timeout
+
+        async def fetch(module: InventoryModule) -> list[TargetSpec]:
+            return await asyncio.wait_for(module.list_systems(), timeout)
+
+        fetched = await asyncio.gather(*(fetch(m) for m in modules), return_exceptions=True)
+        result = Inventory()
+        seen: set[str] = set()
+
+        def merge(source: InventorySource, systems: list[TargetSpec]) -> None:
+            for system in systems:
+                if system.name in seen:
+                    source.skipped.append(system.name)
+                    continue
+                seen.add(system.name)
+                result.systems.append(system.model_copy(update={"source": source.id}))
+                source.systems += 1
+            result.sources.append(source)
+
+        if self.settings.targets or not modules:
+            merge(InventorySource(id=CONFIG_INVENTORY, type="config"), self.settings.targets)
+        for module, systems in zip(modules, fetched, strict=True):
+            source = InventorySource(
+                id=module.instance_id,
+                type=self.settings.modules[module.instance_id].type,
+                writable=module.writable,
+            )
+            if isinstance(systems, BaseException):
+                if not isinstance(systems, Exception):
+                    raise systems
+                source.ok = False
+                source.error = (
+                    f"timed out after {timeout:g}s"
+                    if isinstance(systems, TimeoutError)
+                    else _describe(systems)
+                )
+                log.warning("inventory %s is unavailable: %s", module.instance_id, source.error)
+                merge(source, [])
+            else:
+                merge(source, systems)
+        return result
+
+    async def get_system(self, name: str) -> TargetSpec:
+        inventory = await self.inventory()
+        for system in inventory.systems:
+            if system.name == name:
+                return system
+        raise NotFoundError(f"no system named {name!r}{_unavailable(inventory)}")
+
+    async def put_system(self, inventory_id: str, system: TargetSpec, actor: Actor) -> TargetSpec:
+        """Add or replace a system in a writable inventory, after checking it is usable."""
+        module = self.inventory_module(inventory_id)
+        if not module.writable:
+            raise RequestError(f"inventory {inventory_id!r} is read-only")
+        system = system.model_copy(update={"source": None})
+        problems = self.check_system(system)
+        if problems:
+            raise RequestError(f"system {system.name!r}: {'; '.join(problems)}")
+        current = await self.inventory()
+        elsewhere = [s.source for s in current.systems if s.name == system.name]
+        if elsewhere and elsewhere[0] != inventory_id:
+            raise ConflictError(
+                f"a system named {system.name!r} already comes from inventory {elsewhere[0]!r}"
+            )
+        if system.name in self._busy_targets:
+            raise ConflictError(f"rollover in progress for {system.name!r}; try again later")
+        action = "inventory.system.update" if elsewhere else "inventory.system.add"
+        try:
+            await module.put_system(system)
+        except Exception as exc:
+            await self.audit.record(
+                action,
+                Outcome.FAILURE,
+                actor=actor,
+                target=system.name,
+                module=inventory_id,
+                message=_describe(exc),
+            )
+            raise
+        await self.audit.record(
+            action,
+            Outcome.SUCCESS,
+            actor=actor,
+            target=system.name,
+            module=inventory_id,
+            system=_audit_view(system),
+        )
+        return system.model_copy(update={"source": inventory_id})
+
+    async def delete_system(self, inventory_id: str, name: str, actor: Actor) -> None:
+        module = self.inventory_module(inventory_id)
+        if not module.writable:
+            raise RequestError(f"inventory {inventory_id!r} is read-only")
+        if name in self._busy_targets:
+            raise ConflictError(f"rollover in progress for {name!r}; try again later")
+        if not await module.delete_system(name):
+            raise NotFoundError(f"inventory {inventory_id!r} has no system named {name!r}")
+        await self.audit.record(
+            "inventory.system.delete",
+            Outcome.SUCCESS,
+            actor=actor,
+            target=name,
+            module=inventory_id,
+        )
+
+    async def refresh_inventory(self, actor: Actor) -> Inventory:
+        for module in self.all_of(InventoryModule):
+            await module.refresh()
+        inventory = await self.inventory()
+        await self.audit.record(
+            "inventory.refresh",
+            Outcome.SUCCESS,
+            actor=actor,
+            sources={s.id: s.systems if s.ok else s.error for s in inventory.sources},
+        )
+        return inventory
+
+    async def select_targets(self, request: RolloverRequest) -> list[TargetSpec]:
+        inventory = await self.inventory()
+        systems = inventory.systems
+        by_name = {t.name: t for t in systems}
         unknown = [name for name in request.targets if name not in by_name]
         if unknown:
-            raise RequestError(f"unknown target(s): {', '.join(unknown)}")
-        known_groups = {g for t in self.settings.targets for g in t.groups}
+            raise RequestError(f"unknown target(s): {', '.join(unknown)}{_unavailable(inventory)}")
+        known_groups = {g for t in systems for g in t.groups}
         unknown_groups = [g for g in request.groups if g not in known_groups]
         if unknown_groups:
-            raise RequestError(f"unknown group(s): {', '.join(unknown_groups)}")
+            raise RequestError(
+                f"unknown group(s): {', '.join(unknown_groups)}{_unavailable(inventory)}"
+            )
         selected = [
             t
-            for t in self.settings.targets
+            for t in systems
             if request.all or t.name in request.targets or set(t.groups) & set(request.groups)
         ]
         if not selected:
             raise RequestError("no targets selected; name targets, groups, or set all")
+        problems = [f"{t.name}: {'; '.join(p)}" for t in selected if (p := self.check_system(t))]
+        if problems:
+            raise RequestError("cannot roll over " + " | ".join(problems))
         return selected
 
     # -- rollovers -----------------------------------------------------------
 
     async def start_rollover(self, request: RolloverRequest, actor: Actor) -> RolloverRun:
-        targets = self.select_targets(request)
+        targets = await self.select_targets(request)
         busy = [t.name for t in targets if t.name in self._busy_targets]
         if busy:
-            raise RequestError(f"rollover already in progress for: {', '.join(busy)}")
+            raise ConflictError(f"rollover already in progress for: {', '.join(busy)}")
         run = RolloverRun(
             requested_by=actor,
             reason=request.reason,
             dry_run=request.dry_run,
             results=[
                 TargetResult(
-                    target=t.name, host=t.host, account=t.account, secret_path=t.secret_path
+                    target=t.name,
+                    host=t.host,
+                    account=t.account,
+                    source=t.source,
+                    secret_path=t.secret_path,
                 )
                 for t in targets
             ],
@@ -240,6 +423,7 @@ class Orchestrator:
                         result=result,
                         target_module=self._target_module(target),
                         secrets=self._secrets_module(target),
+                        service_secrets=self._service_secrets(target),
                         generator=self.one_of(GeneratorModule, self.settings.rollover.generator),
                         audit=self.audit,
                         staging_suffix=self.settings.rollover.staging_suffix,
@@ -287,6 +471,35 @@ class Orchestrator:
                 )
             except Exception:
                 log.exception("could not record the end of run %s", run.id)
+
+
+def _describe(exc: BaseException) -> str:
+    return str(exc) or type(exc).__name__
+
+
+def _unavailable(inventory: Inventory) -> str:
+    down = [f"{s.id} ({s.error})" for s in inventory.sources if not s.ok]
+    return f"; unavailable inventories: {', '.join(down)}" if down else ""
+
+
+def _audit_view(system: TargetSpec) -> dict[str, object]:
+    """What the audit log records about a system: where it is and how SDL reaches it."""
+    return system.model_dump(
+        mode="json",
+        include={
+            "hostname",
+            "fqdn",
+            "addresses",
+            "host",
+            "port",
+            "module",
+            "account",
+            "secret_path",
+            "secrets",
+            "service_account",
+            "groups",
+        },
+    )
 
 
 def _summarise(run: RolloverRun) -> RunStatus:

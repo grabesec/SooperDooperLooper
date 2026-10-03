@@ -46,6 +46,8 @@ sdl = "sdl.cli.main:main"
 "audit.jsonl" = "sdl.modules.audit_jsonl:JsonlAuditModule"
 "auth.static_token" = "sdl.modules.auth_static_token:StaticTokenAuthModule"
 "generator.password" = "sdl.modules.generator_password:PasswordGeneratorModule"
+"inventory.netbox" = "sdl.modules.inventory_netbox:NetBoxInventoryModule"
+"inventory.store" = "sdl.modules.inventory_store:StoreInventoryModule"
 "secrets.vault" = "sdl.modules.secrets_vault:VaultKV2SecretsModule"
 "target.ssh_linux" = "sdl.modules.target_ssh_linux:SshLinuxTargetModule"
 
