@@ -1,8 +1,9 @@
 """Bearer-token authentication from a static list of API clients.
 
 Only SHA-256 hashes of the tokens are kept in the configuration. Generate a
-token and its hash with ``sdl token new``. This is the bootstrap auth module;
-OIDC, Entra ID and other IAM providers plug in as further auth modules.
+token and its hash with ``sdl token new``. It is meant for machine clients
+(scripts, CI jobs, the MCP server); people sign in as users instead (see
+docs/users.md).
 """
 
 from __future__ import annotations
@@ -13,9 +14,9 @@ from typing import TYPE_CHECKING
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-from sdl.core.models import Actor, ActorType
+from sdl.core.models import Access, Actor, ActorType
 from sdl.core.module import AuthModule, ModuleConfig
-from sdl.core.permissions import ROLE_PERMISSIONS
+from sdl.core.permissions import check_roles
 
 if TYPE_CHECKING:
     from fastapi import Request
@@ -29,6 +30,10 @@ class TokenClient(BaseModel):
     token_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     roles: list[str] = Field(default_factory=lambda: ["operator"])
     type: ActorType = ActorType.USER
+    access: Access | None = Field(
+        default=None,
+        description="Inventory groups and systems this client reaches; every system when unset.",
+    )
 
 
 class StaticTokenConfig(ModuleConfig):
@@ -36,9 +41,7 @@ class StaticTokenConfig(ModuleConfig):
 
     @model_validator(mode="after")
     def _known_roles(self) -> StaticTokenConfig:
-        unknown = {r for c in self.clients for r in c.roles} - set(ROLE_PERMISSIONS)
-        if unknown:
-            raise ValueError(f"unknown role(s): {', '.join(sorted(unknown))}")
+        check_roles([r for c in self.clients for r in c.roles])
         return self
 
 
@@ -64,5 +67,6 @@ class StaticTokenAuthModule(AuthModule):
                     id=client.id,
                     display_name=client.display_name,
                     roles=list(client.roles),
+                    access=client.access,
                 )
         return None

@@ -26,13 +26,51 @@ class ActorType(StrEnum):
     SYSTEM = "system"
 
 
+class Access(BaseModel):
+    """Which systems someone may see and act on: whole groups and individual systems.
+
+    Roles say *what* a caller may do (run rollovers, read the log...); access
+    says *on which systems*. A system is within reach when it is listed by
+    name, or belongs to one of the groups, or when ``all_systems`` is set.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    all_systems: bool = False
+    groups: list[str] = Field(default_factory=list, description="Inventory groups.")
+    systems: list[str] = Field(default_factory=list, description="Individual systems, by name.")
+
+    def permits(self, system: TargetSpec) -> bool:
+        return (
+            self.all_systems
+            or system.name in self.systems
+            or any(g in self.groups for g in system.groups)
+        )
+
+    def union(self, other: Access) -> Access:
+        return Access(
+            all_systems=self.all_systems or other.all_systems,
+            groups=sorted({*self.groups, *other.groups}),
+            systems=sorted({*self.systems, *other.systems}),
+        )
+
+
 class Actor(BaseModel):
-    """Who performed an action. Every audit event names one."""
+    """Who performed an action. Every audit event names one.
+
+    ``access`` limits which systems the actor reaches; ``None`` means every
+    system. It is set by the core when it authenticates a caller and is never
+    written to the audit log.
+    """
 
     type: ActorType
     id: str
     display_name: str | None = None
     roles: list[str] = Field(default_factory=list)
+    access: Access | None = Field(default=None, exclude=True)
+
+    def permits(self, system: TargetSpec) -> bool:
+        return self.access is None or self.access.permits(system)
 
     @classmethod
     def system(cls, component: str = "orchestrator") -> Actor:
@@ -105,6 +143,12 @@ class AuditQuery(BaseModel):
     text: str | None = Field(default=None, description="Words to find in the message.")
     limit: int = Field(default=200, ge=1, le=100_000)
     newest_first: bool = False
+    scope_targets: list[str] | None = Field(
+        default=None,
+        description="Set by the core for callers limited to some systems: only events about "
+        "these systems, or done by or for ``scope_actors``, are returned.",
+    )
+    scope_actors: list[str] = Field(default_factory=list)
 
     @field_validator("since", "until")
     @classmethod
@@ -114,6 +158,10 @@ class AuditQuery(BaseModel):
         return value
 
     def matches(self, event: AuditEvent) -> bool:
+        if self.scope_targets is not None and event.target not in self.scope_targets:
+            ids = {event.actor.id, event.initiated_by.id if event.initiated_by else None}
+            if not ids & set(self.scope_actors):
+                return False
         if self.targets and event.target not in self.targets:
             return False
         if self.modules and event.module not in self.modules:
@@ -344,3 +392,118 @@ class RolloverRun(BaseModel):
     @property
     def done(self) -> bool:
         return self.status not in (RunStatus.PENDING, RunStatus.RUNNING)
+
+
+# -- users -----------------------------------------------------------------------
+
+USER_NAME_PATTERN = r"^[a-z0-9][a-z0-9_.@+#-]*$"
+LOCAL_SOURCE = "local"
+"""``UserRecord.source`` of users whose password SDL itself checks."""
+
+
+class UserRecord(BaseModel):
+    """A user as kept by the user-store module.
+
+    Local users (``source == "local"``) sign in with a password SDL checks and,
+    optionally, a TOTP code. Users from an identity provider (Active Directory,
+    Entra ID, ...) carry that provider's instance id as ``source``; SDL keeps a
+    record of them so administrators can see them, disable them, and assign
+    them extra roles, groups and systems on top of what the provider's groups map to.
+
+    Names are lower case: ``Alice`` and ``alice`` are the same user.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: str = Field(min_length=1, max_length=255, pattern=USER_NAME_PATTERN)
+    display_name: str | None = Field(default=None, max_length=255)
+    email: str | None = Field(default=None, max_length=255)
+    source: str = LOCAL_SOURCE
+    enabled: bool = True
+    roles: list[str] = Field(default_factory=list)
+    access: Access = Field(default_factory=Access)
+    password_hash: str | None = None
+    must_change_password: bool = False
+    totp_secret: SecretStr | None = None
+    external_groups: list[str] = Field(
+        default_factory=list, description="Groups the identity provider reported at last sign-in."
+    )
+    created_at: datetime = Field(default_factory=utcnow)
+    updated_at: datetime = Field(default_factory=utcnow)
+    password_changed_at: datetime | None = None
+    last_login: datetime | None = None
+
+    @field_validator("name", mode="before")
+    @classmethod
+    def _lower(cls, value: Any) -> Any:
+        return value.strip().lower() if isinstance(value, str) else value
+
+    @property
+    def local(self) -> bool:
+        return self.source == LOCAL_SOURCE
+
+    @property
+    def mfa(self) -> bool:
+        return self.totp_secret is not None
+
+
+class UserView(BaseModel):
+    """A user as the API shows it: no password hash, no TOTP secret."""
+
+    name: str
+    display_name: str | None
+    email: str | None
+    source: str
+    enabled: bool
+    roles: list[str]
+    access: Access
+    has_password: bool
+    must_change_password: bool
+    mfa: bool
+    external_groups: list[str]
+    created_at: datetime
+    updated_at: datetime
+    password_changed_at: datetime | None
+    last_login: datetime | None
+
+    @classmethod
+    def of(cls, user: UserRecord) -> UserView:
+        return cls(
+            **user.model_dump(exclude={"password_hash", "totp_secret"}),
+            has_password=user.password_hash is not None,
+            mfa=user.mfa,
+        )
+
+
+class ExternalIdentity(BaseModel):
+    """Who an identity provider says a user is, and the provider groups they belong to."""
+
+    username: str
+    display_name: str | None = None
+    email: str | None = None
+    groups: list[str] = Field(default_factory=list)
+
+    @field_validator("username")
+    @classmethod
+    def _lower(cls, value: str) -> str:
+        return value.strip().lower()
+
+
+class GroupMapping(BaseModel):
+    """What membership of one identity-provider group grants in SDL."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    group: str = Field(
+        min_length=1,
+        description="Provider group: a name, a DN (LDAP) or an object id (Entra ID). "
+        "Compared without regard to case.",
+    )
+    roles: list[str] = Field(default_factory=list)
+    all_systems: bool = False
+    groups: list[str] = Field(default_factory=list, description="SDL inventory groups.")
+    systems: list[str] = Field(default_factory=list, description="Individual SDL systems.")
+
+    @property
+    def access(self) -> Access:
+        return Access(all_systems=self.all_systems, groups=self.groups, systems=self.systems)

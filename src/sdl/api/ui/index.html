@@ -12,6 +12,7 @@
   <h1>SooperDooperLooper</h1>
   <div id="who" class="who" hidden>
     <span id="who-name"></span>
+    <button id="my-account" type="button" class="link">My account</button>
     <button id="sign-out" type="button" class="link">Sign out</button>
   </div>
 </header>
@@ -19,12 +20,49 @@
 <main>
   <section id="signin" class="card narrow" hidden>
     <h2>Sign in</h2>
-    <p class="muted">Paste your SDL API token. It is kept in this browser tab only.</p>
     <form id="signin-form">
-      <label>API token <input id="token" type="password" autocomplete="off" required></label>
+      <label id="provider-row" hidden>Sign in with <select id="provider"></select></label>
+      <label>User name <input id="username" autocomplete="username" required></label>
+      <label>Password <input id="password" type="password" autocomplete="current-password" required></label>
+      <label id="code-row" hidden>Code from your authenticator app
+        <input id="code" inputmode="numeric" autocomplete="one-time-code" maxlength="8" pattern="[0-9 ]*">
+      </label>
       <button type="submit">Sign in</button>
-      <p id="signin-error" class="error" role="alert"></p>
     </form>
+    <div id="sso-buttons" class="sso"></div>
+    <details class="token-signin">
+      <summary>Use an API token instead</summary>
+      <form id="token-form">
+        <p class="muted">The token is kept in this browser tab only.</p>
+        <label>API token <input id="token" type="password" autocomplete="off" required></label>
+        <button type="submit" class="secondary">Sign in with token</button>
+      </form>
+    </details>
+    <p id="signin-error" class="error" role="alert"></p>
+  </section>
+
+  <section id="cli-code" class="card narrow" hidden>
+    <h2>Signed in</h2>
+    <p>Paste this code into the <code>sdl login</code> prompt. It works once, for one minute.</p>
+    <p><input id="cli-code-value" readonly class="mono wide-input"></p>
+  </section>
+
+  <section id="pending" class="card narrow" hidden>
+    <h2>Before you continue</h2>
+    <div id="pending-password" hidden>
+      <p>Choose a new password: the one you were given was temporary.</p>
+      <form id="pending-password-form" class="stack">
+        <label>Current password <input id="pp-current" type="password" autocomplete="current-password" required></label>
+        <label>New password <input id="pp-new" type="password" autocomplete="new-password" required></label>
+        <label>New password again <input id="pp-again" type="password" autocomplete="new-password" required></label>
+        <button type="submit">Change password</button>
+      </form>
+    </div>
+    <div id="pending-mfa" hidden>
+      <p>Set up an authenticator app (any TOTP app: Microsoft or Google Authenticator, 1Password...).</p>
+      <div class="mfa-box"></div>
+    </div>
+    <p id="pending-error" class="error" role="alert"></p>
   </section>
 
   <div id="app" hidden>
@@ -85,6 +123,26 @@
     <section id="history" class="card" hidden>
       <h2>Recent runs</h2>
       <ul id="runs" class="runs"></ul>
+    </section>
+
+    <section id="users" class="card" hidden>
+      <div class="section-head">
+        <h2>Users</h2>
+        <div class="tools">
+          <input id="user-filter" type="search" placeholder="Filter users">
+          <button id="import-user" type="button" class="secondary" hidden>Add from directory</button>
+          <button id="add-user" type="button" class="secondary" hidden>Add user</button>
+        </div>
+      </div>
+      <p class="muted">Roles say what someone may do; groups and systems say where. The superuser is kept in its own file and is not listed.</p>
+      <div class="table-wrap">
+        <table id="user-table">
+          <thead><tr><th>User</th><th>Signs in with</th><th>State</th><th>Roles</th><th>Reaches</th><th>MFA</th><th>Last sign-in</th><th></th></tr></thead>
+          <tbody></tbody>
+        </table>
+      </div>
+      <p id="users-empty" class="muted" hidden>No users yet.</p>
+      <p id="users-error" class="error" role="alert"></p>
     </section>
 
     <section id="log" class="card" hidden>
@@ -166,6 +224,86 @@
       <button id="system-cancel" type="button" class="secondary">Cancel</button>
       <button type="submit">Save</button>
     </div>
+  </form>
+</dialog>
+
+<dialog id="user-dialog">
+  <form id="user-form" method="dialog">
+    <h2 id="user-dialog-title">Add user</h2>
+    <div class="grid">
+      <label>User name <input id="u-name" required pattern="[A-Za-z0-9][A-Za-z0-9_.@+#\-]*" autocomplete="off"></label>
+      <label>Display name <input id="u-display"></label>
+      <label>Email <input id="u-email" type="email"></label>
+      <label id="u-password-row">Initial password (they change it at first sign-in)
+        <input id="u-password" type="password" autocomplete="new-password">
+      </label>
+    </div>
+    <fieldset>
+      <legend>Roles</legend>
+      <div id="u-roles" class="checks"></div>
+    </fieldset>
+    <fieldset>
+      <legend>Systems this user reaches</legend>
+      <label class="inline"><input id="u-all" type="checkbox"> Every system</label>
+      <div class="grid">
+        <label>Inventory groups <select id="u-groups" multiple size="6"></select></label>
+        <label>Individual systems <select id="u-systems" multiple size="6"></select></label>
+      </div>
+      <div class="grid">
+        <label>More groups (not in the inventory yet) <input id="u-extra-groups" placeholder="db, prod"></label>
+        <label>More systems (not in the inventory yet) <input id="u-extra-systems" placeholder="db9"></label>
+      </div>
+    </fieldset>
+    <label class="inline"><input id="u-enabled" type="checkbox" checked> Enabled</label>
+    <p id="u-source" class="muted"></p>
+    <p id="user-error" class="error" role="alert"></p>
+    <div class="actions">
+      <button id="user-cancel" type="button" class="secondary">Cancel</button>
+      <button type="submit">Save</button>
+    </div>
+  </form>
+</dialog>
+
+<dialog id="import-dialog">
+  <form id="import-form" method="dialog">
+    <h2>Add users from a directory</h2>
+    <div class="grid">
+      <label>Directory <select id="i-provider"></select></label>
+      <label>Search <input id="i-query" type="search" placeholder="name, user name or email"></label>
+    </div>
+    <div class="actions left"><button id="i-search" type="button" class="secondary">Search</button></div>
+    <div class="table-wrap">
+      <table id="i-results">
+        <thead><tr><th>User name</th><th>Name</th><th>Email</th><th>Directory groups</th><th></th></tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+    <p class="muted">Directory users can also simply sign in: their groups decide what they get. Adding them here first lets you give them roles, groups and systems of their own.</p>
+    <p id="import-error" class="error" role="alert"></p>
+    <div class="actions"><button id="import-close" type="button" class="secondary">Close</button></div>
+  </form>
+</dialog>
+
+<dialog id="account-dialog">
+  <form method="dialog" id="account-form">
+    <h2>My account</h2>
+    <p id="account-summary"></p>
+    <div id="account-password" hidden>
+      <h3>Change password</h3>
+      <div class="grid">
+        <label>Current password <input id="ap-current" type="password" autocomplete="current-password"></label>
+        <label>New password <input id="ap-new" type="password" autocomplete="new-password"></label>
+        <label>New password again <input id="ap-again" type="password" autocomplete="new-password"></label>
+      </div>
+      <div class="actions left"><button id="ap-save" type="button" class="secondary">Change password</button></div>
+    </div>
+    <div id="account-mfa" hidden>
+      <h3>Authenticator app</h3>
+      <div class="mfa-box"></div>
+    </div>
+    <p id="account-message" class="muted" role="status"></p>
+    <p id="account-error" class="error" role="alert"></p>
+    <div class="actions"><button id="account-close" type="button" class="secondary">Close</button></div>
   </form>
 </dialog>
 </body>

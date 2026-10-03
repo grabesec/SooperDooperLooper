@@ -1,6 +1,6 @@
-// SDL page: pick systems from the inventory, roll them over, watch each
-// system's result, and review the audit log. Everything goes through the same HTTP API the
-// CLI uses; this page holds no state of its own beyond the tab's token.
+// SDL page: sign in, pick systems from the inventory, roll them over, watch each
+// system's result, review the audit log, and manage users. Everything goes through the same
+// HTTP API the CLI uses; this page holds no state of its own beyond the tab's session token.
 "use strict";
 
 const TOKEN_KEY = "sdl.token";
@@ -17,6 +17,11 @@ const STATUS_LABELS = {
 
 const state = {
   me: null,
+  providers: [],
+  roles: [],
+  users: [],
+  idps: [],
+  editingUser: null,
   systems: [],
   sources: [],
   selected: new Set(),
@@ -64,7 +69,7 @@ async function api(method, path, body) {
     method, headers, body: body === undefined ? undefined : JSON.stringify(body),
   });
   if (response.status === 401) {
-    signOut("Your token was not accepted.");
+    signOut("Your sign-in has ended. Please sign in again.");
     throw new ApiError(401, "not signed in");
   }
   if (response.status === 204) return null;
@@ -81,6 +86,83 @@ const can = (permission) => Boolean(state.me && state.me.permissions.includes(pe
 
 // -- sign in -----------------------------------------------------------------
 
+async function loadProviders() {
+  try {
+    const response = await fetch("/api/v1/auth/providers");
+    state.providers = response.ok ? await response.json() : [];
+  } catch { state.providers = []; }
+  const passwordProviders = state.providers.filter((p) => p.login === "password");
+  $("provider").replaceChildren(...passwordProviders.map((p) => el("option", { value: p.id }, p.name)));
+  $("provider-row").hidden = passwordProviders.length < 2;
+  $("signin-form").hidden = passwordProviders.length === 0;
+  $("sso-buttons").replaceChildren(...state.providers.filter((p) => p.login === "redirect").map((p) => {
+    const button = el("button", { type: "button", class: "secondary" }, `Sign in with ${p.name}`);
+    button.addEventListener("click", () => {
+      window.location.href = `/api/v1/auth/sso/${encodeURIComponent(p.id)}/start?return_to=ui`;
+    });
+    return button;
+  }));
+}
+
+async function passwordSignIn(event) {
+  event.preventDefault();
+  $("signin-error").textContent = "";
+  const body = {
+    username: $("username").value.trim(),
+    password: $("password").value,
+    provider: $("provider").value || null,
+    code: $("code").value.replace(/\s/g, "") || null,
+  };
+  const response = await fetch("/api/v1/auth/login", {
+    method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
+  });
+  const data = await response.json().catch(() => null);
+  if (!response.ok) {
+    const detail = data && data.detail;
+    if (detail && detail.mfa_required) {
+      $("code-row").hidden = false;
+      $("code").focus();
+      $("signin-error").textContent = detail.message;
+    } else {
+      $("signin-error").textContent = (detail && (detail.message || detail)) || `HTTP ${response.status}`;
+    }
+    return;
+  }
+  $("password").value = "";
+  $("code").value = "";
+  $("code-row").hidden = true;
+  await signIn(data.token);
+}
+
+async function finishSso() {
+  // A single sign-on comes back as /ui/#sso=<one-time code> (or #sso_error=, #cli_code=).
+  const params = new URLSearchParams(window.location.hash.slice(1));
+  if (![...params.keys()].length) return false;
+  history.replaceState(null, "", window.location.pathname);
+  if (params.get("sso_error")) {
+    signOut(params.get("sso_error"));
+    return true;
+  }
+  if (params.get("cli_code")) {
+    $("signin").hidden = true;
+    $("cli-code").hidden = false;
+    $("cli-code-value").value = params.get("cli_code");
+    $("cli-code-value").select();
+    return true;
+  }
+  if (params.get("sso")) {
+    const response = await fetch("/api/v1/auth/sso/exchange", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ code: params.get("sso") }),
+    });
+    const data = await response.json().catch(() => null);
+    if (!response.ok) signOut((data && data.detail) || "Sign-in failed.");
+    else await signIn(data.token);
+    return true;
+  }
+  return false;
+}
+
 async function signIn(value) {
   setToken(value);
   try {
@@ -90,28 +172,133 @@ async function signIn(value) {
     return;
   }
   $("signin").hidden = true;
-  $("app").hidden = false;
   $("who").hidden = false;
-  const roles = state.me.actor.roles.join(", ");
+  const roles = state.me.pending.length ? "setup needed" : state.me.actor.roles.join(", ") || "no role";
   $("who-name").textContent = `${state.me.actor.display_name || state.me.actor.id} (${roles})`;
+  $("my-account").hidden = !state.me.signed_in_with || state.me.pending.length > 0;
+  if (state.me.pending.length) {
+    showPending();
+    return;
+  }
+  $("pending").hidden = true;
+  $("app").hidden = false;
   $("history").hidden = !can("rollover:read");
   $("log").hidden = !can("audit:read");
+  $("users").hidden = !can("users:read");
   await loadSystems();
   if (can("rollover:read")) await loadRuns();
   updateRunButton();
   if (can("audit:read")) await loadLog();
+  if (can("users:read")) await loadUsers();
 }
 
-function signOut(message) {
+async function signOut(message) {
+  const current = state.token || token();
+  if (current && current.startsWith("sdls_") && state.me) {
+    fetch("/api/v1/auth/logout", { method: "POST", headers: { Authorization: `Bearer ${current}` } }).catch(() => {});
+  }
   setToken(null);
   state.me = null;
   state.selected.clear();
   clearTimeout(state.pollTimer);
   $("app").hidden = true;
   $("who").hidden = true;
+  $("pending").hidden = true;
+  $("cli-code").hidden = true;
   $("signin").hidden = false;
   $("signin-error").textContent = message || "";
   $("token").value = "";
+  $("password").value = "";
+}
+
+// -- your own account: forced password change, authenticator app ---------------
+
+function showPending() {
+  $("app").hidden = true;
+  $("pending").hidden = false;
+  $("pending-error").textContent = "";
+  const pending = state.me.pending;
+  $("pending-password").hidden = !pending.includes("password_change");
+  const mfa = !pending.includes("password_change") && pending.includes("mfa_enrollment");
+  $("pending-mfa").hidden = !mfa;
+  if (mfa) startTotp($("pending-mfa").querySelector(".mfa-box"), $("pending-error"));
+}
+
+function checkNewPassword(newId, againId) {
+  if ($(newId).value !== $(againId).value) throw new Error("The new passwords do not match.");
+}
+
+async function changePassword(currentId, newId, againId) {
+  checkNewPassword(newId, againId);
+  await api("POST", "/api/v1/me/password", {
+    current_password: $(currentId).value, new_password: $(newId).value,
+  });
+  for (const id of [currentId, newId, againId]) $(id).value = "";
+}
+
+async function startTotp(box, errorNode) {
+  box.replaceChildren(el("p", { class: "muted" }, "Preparing…"));
+  let enrollment;
+  try {
+    enrollment = await api("POST", "/api/v1/me/mfa/totp");
+  } catch (err) {
+    box.replaceChildren();
+    errorNode.textContent = err.message;
+    return;
+  }
+  const grouped = enrollment.secret.match(/.{1,4}/g).join(" ");
+  const code = el("input", { inputmode: "numeric", autocomplete: "one-time-code", maxLength: 8, required: true });
+  const confirmButton = el("button", { type: "button" }, "Confirm");
+  confirmButton.addEventListener("click", async () => {
+    errorNode.textContent = "";
+    try {
+      await api("POST", "/api/v1/me/mfa/totp/confirm", { code: code.value.replace(/\s/g, "") });
+    } catch (err) {
+      errorNode.textContent = err.message;
+      return;
+    }
+    if ($("account-dialog").open) $("account-dialog").close();
+    await signIn(state.token || token());
+  });
+  box.replaceChildren(
+    el("ol", {},
+      el("li", {}, "In the app, add an account by entering this key (time based):",
+        el("div", { class: "secret mono" }, grouped)),
+      el("li", {}, "On a phone, you can instead open ", el("a", { href: enrollment.uri }, "this link"), "."),
+      el("li", {}, "Enter the code the app shows:")),
+    el("div", { class: "inline-form" }, code, confirmButton),
+  );
+  code.focus();
+}
+
+function openAccount() {
+  const me = state.me;
+  $("account-error").textContent = "";
+  $("account-message").textContent = "";
+  const how = { local: "an SDL password", superuser: "the superuser account" }[me.signed_in_with]
+    || ((state.providers.find((p) => p.id === me.signed_in_with) || {}).name || me.signed_in_with);
+  $("account-summary").textContent = `${me.actor.id}, signed in with ${how}`
+    + (me.session_expires_at ? ` until ${new Date(me.session_expires_at).toLocaleString()}` : "")
+    + `. Reaches ${describeAccess(me.access)}.`;
+  $("account-password").hidden = !me.can_change_password;
+  const box = $("account-mfa").querySelector(".mfa-box");
+  $("account-mfa").hidden = me.signed_in_with === "superuser" && !me.mfa;
+  if (me.mfa) {
+    box.replaceChildren(el("p", {}, "An authenticator app is set up. If you lose it, ask an administrator to reset it."));
+  } else if (me.signed_in_with === "superuser") {
+    box.replaceChildren();
+  } else {
+    const start = el("button", { type: "button", class: "secondary" }, "Set up an authenticator app");
+    start.addEventListener("click", () => startTotp(box, $("account-error")));
+    box.replaceChildren(el("p", { class: "muted" }, "Not set up: sign-in only asks for your password."), start);
+  }
+  $("account-dialog").showModal();
+}
+
+function describeAccess(access) {
+  if (!access || access.all_systems) return "every system";
+  const parts = [...access.groups.map((g) => `group ${g}`), ...access.systems.map((s) => `system ${s}`)];
+  return parts.length ? parts.join(", ") : "no systems";
 }
 
 // -- systems -------------------------------------------------------------------
@@ -491,11 +678,222 @@ async function showSystemLog(name) {
   $("log").scrollIntoView({ behavior: "smooth" });
 }
 
+// -- users ---------------------------------------------------------------------------
+
+async function loadUsers() {
+  $("users-error").textContent = "";
+  try {
+    const [users, roles, idps] = await Promise.all([
+      api("GET", "/api/v1/users"),
+      state.roles.length ? state.roles : api("GET", "/api/v1/roles"),
+      api("GET", "/api/v1/idps"),
+    ]);
+    state.users = users;
+    state.roles = roles;
+    state.idps = idps;
+  } catch (err) {
+    $("users-error").textContent = err.message;
+    return;
+  }
+  const manage = can("users:write") && (!state.me.access || state.me.access.all_systems);
+  $("add-user").hidden = !manage;
+  $("import-user").hidden = !(manage && state.idps.some((p) => p.can_search));
+  renderUsers();
+}
+
+function renderUsers() {
+  const words = $("user-filter").value.toLowerCase().split(/\s+/).filter(Boolean);
+  const manage = !$("add-user").hidden;
+  const providerName = (id) => (state.idps.find((p) => p.id === id) || {}).name || id;
+  const shown = state.users.filter((u) => {
+    const hay = [u.name, u.display_name, u.email, u.source, ...u.roles, ...u.access.groups, ...u.access.systems]
+      .filter(Boolean).join(" ").toLowerCase();
+    return words.every((w) => hay.includes(w));
+  });
+  const rows = shown.map((u) => {
+    const buttons = [];
+    if (manage) {
+      const add = (label, cls, fn) => {
+        const b = el("button", { type: "button", class: cls }, label);
+        b.addEventListener("click", fn);
+        buttons.push(b);
+      };
+      add("Edit", "secondary", () => openUserDialog(u));
+      if (u.source === "local") add("Set password", "secondary", () => setUserPassword(u));
+      if (u.mfa) add("Reset MFA", "secondary", () => userAction(u, "DELETE", "mfa", `Remove ${u.name}'s authenticator? They set up a new one at next sign-in.`));
+      add("Unlock", "secondary", () => userAction(u, "POST", "unlock", null));
+      add("Delete", "danger", () => userAction(u, "DELETE", "", `Remove ${u.name} from SDL?`));
+    }
+    let stateText = u.enabled ? "Enabled" : "Disabled";
+    if (u.must_change_password) stateText += " · must change password";
+    if (u.source === "local" && !u.has_password) stateText += " · no password yet";
+    return el("tr", {},
+      el("td", {}, el("strong", {}, u.name), u.display_name ? el("div", { class: "muted" }, u.display_name) : null),
+      el("td", {}, u.source === "local" ? "SDL password" : providerName(u.source),
+        u.external_groups.length ? el("div", { class: "muted" }, `groups: ${u.external_groups.join(", ")}`) : null),
+      el("td", {}, el("span", { class: `badge ${u.enabled ? "s-succeeded" : "s-failed"}` }, stateText)),
+      el("td", {}, u.roles.length ? u.roles.map((r) => el("span", { class: "chip" }, r)) : el("span", { class: "muted" }, "from directory groups")),
+      el("td", {}, describeAccess(u.access)),
+      el("td", {}, u.mfa ? "TOTP" : (u.source === "local" ? "none" : "provider")),
+      el("td", { class: "nowrap" }, u.last_login ? new Date(u.last_login).toLocaleString() : "never"),
+      el("td", {}, buttons.length ? el("span", { class: "tools" }, buttons) : null),
+    );
+  });
+  $("user-table").tBodies[0].replaceChildren(...rows);
+  $("users-empty").hidden = rows.length > 0;
+}
+
+function fillMultiSelect(select, values, chosen) {
+  select.replaceChildren(...values.map((v) => el("option", { value: v, selected: chosen.includes(v) }, v)));
+}
+
+function openUserDialog(user) {
+  state.editingUser = user || null;
+  const u = user || { name: "", roles: ["operator"], access: { all_systems: false, groups: [], systems: [] }, enabled: true, source: "local" };
+  $("user-dialog-title").textContent = user ? `Edit ${user.name}` : "Add user";
+  $("u-name").value = u.name;
+  $("u-name").readOnly = Boolean(user);
+  $("u-display").value = u.display_name || "";
+  $("u-email").value = u.email || "";
+  $("u-password").value = "";
+  $("u-password-row").hidden = Boolean(user);
+  $("u-roles").replaceChildren(...state.roles.map((r) => el("label", { class: "inline", title: r.permissions.join(", ") },
+    el("input", { type: "checkbox", value: r.name, checked: u.roles.includes(r.name) }), r.name)));
+  const groups = [...new Set(state.systems.flatMap((s) => s.groups))].sort();
+  const systems = state.systems.map((s) => s.name).sort();
+  fillMultiSelect($("u-groups"), groups, u.access.groups);
+  fillMultiSelect($("u-systems"), systems, u.access.systems);
+  $("u-extra-groups").value = u.access.groups.filter((g) => !groups.includes(g)).join(", ");
+  $("u-extra-systems").value = u.access.systems.filter((s) => !systems.includes(s)).join(", ");
+  $("u-all").checked = u.access.all_systems;
+  $("u-enabled").checked = u.enabled;
+  $("u-source").textContent = u.source === "local" ? ""
+    : `Signs in through ${u.source}. Roles, groups and systems set here are added to what the directory groups grant.`;
+  $("user-error").textContent = "";
+  $("user-dialog").showModal();
+}
+
+async function saveUser(event) {
+  event.preventDefault();
+  const picked = (id) => [...$(id).selectedOptions].map((o) => o.value);
+  const access = {
+    all_systems: $("u-all").checked,
+    groups: [...new Set([...picked("u-groups"), ...split($("u-extra-groups").value)])],
+    systems: [...new Set([...picked("u-systems"), ...split($("u-extra-systems").value)])],
+  };
+  const roles = [...$("u-roles").querySelectorAll("input:checked")].map((i) => i.value);
+  const body = {
+    display_name: $("u-display").value.trim() || null,
+    email: $("u-email").value.trim() || null,
+    roles, access, enabled: $("u-enabled").checked,
+  };
+  try {
+    if (state.editingUser) {
+      await api("PATCH", `/api/v1/users/${encodeURIComponent(state.editingUser.name)}`, body);
+    } else {
+      body.name = $("u-name").value.trim();
+      if ($("u-password").value) body.password = $("u-password").value;
+      await api("POST", "/api/v1/users", body);
+    }
+  } catch (err) {
+    $("user-error").textContent = err.message;
+    return;
+  }
+  $("user-dialog").close();
+  await loadUsers();
+}
+
+async function userAction(user, method, suffix, question) {
+  if (question && !confirm(question)) return;
+  try {
+    await api(method, `/api/v1/users/${encodeURIComponent(user.name)}${suffix ? `/${suffix}` : ""}`);
+  } catch (err) {
+    alert(err.message);
+  }
+  await loadUsers();
+}
+
+async function setUserPassword(user) {
+  const password = prompt(`New password for ${user.name} (they must change it at next sign-in):`);
+  if (!password) return;
+  try {
+    await api("POST", `/api/v1/users/${encodeURIComponent(user.name)}/password`, { password, temporary: true });
+  } catch (err) {
+    alert(err.message);
+  }
+  await loadUsers();
+}
+
+function openImportDialog() {
+  const searchable = state.idps.filter((p) => p.can_search);
+  $("i-provider").replaceChildren(...searchable.map((p) => el("option", { value: p.id }, p.name)));
+  $("i-results").tBodies[0].replaceChildren();
+  $("import-error").textContent = "";
+  $("import-dialog").showModal();
+}
+
+async function searchDirectory() {
+  $("import-error").textContent = "";
+  const provider = $("i-provider").value;
+  let found;
+  try {
+    found = await api("GET", `/api/v1/idps/${encodeURIComponent(provider)}/users?${new URLSearchParams({ q: $("i-query").value.trim() })}`);
+  } catch (err) {
+    $("import-error").textContent = err.message;
+    return;
+  }
+  const known = new Set(state.users.map((u) => u.name));
+  $("i-results").tBodies[0].replaceChildren(...found.map((u) => {
+    let action = el("span", { class: "muted" }, "already in SDL");
+    if (!known.has(u.username)) {
+      action = el("button", { type: "button", class: "secondary" }, "Add");
+      action.addEventListener("click", async () => {
+        try {
+          const user = await api("POST", `/api/v1/idps/${encodeURIComponent(provider)}/users`, { username: u.username });
+          known.add(user.name);
+          action.replaceWith(el("span", { class: "ok-text" }, "added"));
+          await loadUsers();
+        } catch (err) {
+          $("import-error").textContent = err.message;
+        }
+      });
+    }
+    return el("tr", {}, el("td", {}, u.username), el("td", {}, u.display_name || ""), el("td", {}, u.email || ""),
+      el("td", {}, u.groups.map((g) => el("span", { class: "chip" }, g))), el("td", {}, action));
+  }));
+}
+
 // -- wiring -------------------------------------------------------------------------
 
 document.addEventListener("DOMContentLoaded", () => {
-  $("signin-form").addEventListener("submit", (e) => { e.preventDefault(); signIn($("token").value.trim()); });
+  $("signin-form").addEventListener("submit", passwordSignIn);
+  $("token-form").addEventListener("submit", (e) => { e.preventDefault(); signIn($("token").value.trim()); });
   $("sign-out").addEventListener("click", () => signOut());
+  $("my-account").addEventListener("click", openAccount);
+  $("account-close").addEventListener("click", () => $("account-dialog").close());
+  $("ap-save").addEventListener("click", async () => {
+    $("account-error").textContent = "";
+    try {
+      await changePassword("ap-current", "ap-new", "ap-again");
+      $("account-message").textContent = "Password changed. Your other sessions have ended.";
+    } catch (err) { $("account-error").textContent = err.message; }
+  });
+  $("pending-password-form").addEventListener("submit", async (e) => {
+    e.preventDefault();
+    $("pending-error").textContent = "";
+    try {
+      await changePassword("pp-current", "pp-new", "pp-again");
+      await signIn(state.token || token());
+    } catch (err) { $("pending-error").textContent = err.message; }
+  });
+  $("user-filter").addEventListener("input", renderUsers);
+  $("add-user").addEventListener("click", () => openUserDialog(null));
+  $("import-user").addEventListener("click", openImportDialog);
+  $("user-form").addEventListener("submit", saveUser);
+  $("user-cancel").addEventListener("click", () => $("user-dialog").close());
+  $("i-search").addEventListener("click", searchDirectory);
+  $("i-query").addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); searchDirectory(); } });
+  $("import-close").addEventListener("click", () => $("import-dialog").close());
   for (const id of ["filter", "group-filter", "source-filter"]) $(id).addEventListener("input", renderSystems);
   $("select-all").addEventListener("change", (e) => {
     for (const s of visibleSystems()) {
@@ -519,7 +917,10 @@ document.addEventListener("DOMContentLoaded", () => {
   $("log-reset").addEventListener("click", () => { resetLogFilters(); loadLog(); });
   $("log-verify").addEventListener("click", verifyLog);
 
-  const saved = token();
-  if (saved) signIn(saved);
-  else signOut();
+  loadProviders().then(async () => {
+    if (await finishSso()) return;
+    const saved = token();
+    if (saved) signIn(saved);
+    else signOut();
+  });
 });

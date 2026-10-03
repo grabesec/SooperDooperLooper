@@ -151,6 +151,8 @@ def make_settings(
     targets: list[dict[str, Any]] | None = None,
     secrets_config: dict[str, Any] | None = None,
     extra_modules: dict[str, Any] | None = None,
+    identity: dict[str, Any] | None = None,
+    api: dict[str, Any] | None = None,
 ) -> Settings:
     if targets is None:
         targets = [
@@ -192,6 +194,8 @@ def make_settings(
             "targets": [
                 {"module": "linux", "secret_path": f"linux/{t['name']}/root", **t} for t in targets
             ],
+            "identity": identity or {},
+            "api": api or {},
         }
     )
 
