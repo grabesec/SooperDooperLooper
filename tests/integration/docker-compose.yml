@@ -1,0 +1,36 @@
+# Integration test environment: a dev-mode Vault and three SSH "VMs".
+# vm3's service account is deliberately missing its sudo rule.
+name: sdl-it
+
+x-vm: &vm
+  build: ./vm
+  environment: &vm-env
+    SDL_PUBKEY: ${SDL_PUBKEY:?set SDL_PUBKEY}
+    ROOT_PASSWORD: initial-root-password
+
+services:
+  vault:
+    image: hashicorp/vault:1.17
+    command: server -dev -dev-listen-address=0.0.0.0:8200
+    environment:
+      VAULT_DEV_ROOT_TOKEN_ID: sdl-dev-root
+    cap_add: [IPC_LOCK]
+    ports: ["127.0.0.1:18200:8200"]
+
+  vm1:
+    <<: *vm
+    ports: ["127.0.0.1:12221:22"]
+
+  vm2:
+    <<: *vm
+    build:
+      context: ./vm
+      args: {BASE: "${SDL_IT_VM2_BASE:-debian:12-slim}"}
+    ports: ["127.0.0.1:12222:22"]
+
+  vm3:
+    <<: *vm
+    environment:
+      <<: *vm-env
+      SDL_SUDO: "0"
+    ports: ["127.0.0.1:12223:22"]

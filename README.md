@@ -1,5 +1,94 @@
 # SooperDooperLooper (SDL)
 
-An open-source tool that lets system administrators roll over passwords, API keys and other secrets.
+SDL is an open-source tool that lets a system administrator roll over passwords,
+API keys and other secrets, and proves every step of it in an audit log.
 
-Licensed under the [GNU Affero General Public License v3.0](LICENSE).
+The first supported story: **roll over the root password on a handful of Linux
+VMs right now.** SDL signs in to each VM with an SSH service account, changes
+the password, verifies the new one actually works, stores it in HashiCorp
+Vault, and hands back a per-VM report.
+
+```
+$ sdl rollover run --group web --reason "quarterly rotation"
+Run 3f9c... (rollover) — SUCCEEDED
+Requested by alice: quarterly rotation
+
+TARGET  HOST        ACCOUNT  STATUS  VERSION  DETAIL
+web1    10.0.0.11   root     OK      4        credential rolled over and verified
+web2    10.0.0.12   root     OK      7        credential rolled over and verified
+```
+
+## Design
+
+SDL's backend is an **orchestrator**: a thin core that loads modules and runs
+workflows across them. Everything else is a module, and modules are
+discovered through Python entry points, so third parties can ship their own.
+
+| Kind        | Job                                           | Shipped module                                   |
+|-------------|-----------------------------------------------|--------------------------------------------------|
+| `audit`     | Persist every system and user action          | `audit.jsonl`: hash-chained, tamper-evident file  |
+| `auth`      | Identify API callers                          | `auth.static_token`: hashed bearer tokens         |
+| `generator` | Produce new credentials                       | `generator.password`: CSPRNG password policy      |
+| `secrets`   | Store credentials in a secret manager         | `secrets.vault`: HashiCorp Vault KV v2            |
+| `target`    | Change and verify a credential on a system    | `target.ssh_linux`: Linux accounts over SSH       |
+
+All clients talk to the core through its HTTP API: the bundled `sdl` CLI
+today, and a web GUI and an MCP server (so LLMs can drive SDL) later. User
+management (OIDC, Entra ID, ...) arrives as further `auth` modules.
+
+See [docs/architecture.md](docs/architecture.md) for the module contract and
+[docs/rollover.md](docs/rollover.md) for exactly what happens during a rollover
+and how SDL makes sure a password is never lost.
+
+## Quick start
+
+Requires Python 3.11+.
+
+```bash
+pip install .            # from a checkout; installs the `sdl` command
+cp examples/sdl.yaml sdl.yaml
+sdl token new --id alice --role operator   # paste the printed entry into sdl.yaml
+sdl check-config -c sdl.yaml
+VAULT_TOKEN=... sdl serve -c sdl.yaml      # API on http://127.0.0.1:8800
+```
+
+In another shell:
+
+```bash
+export SDL_TOKEN=<the token printed by `sdl token new`>
+sdl targets
+sdl rollover run --all --reason "test" --dry-run   # pre-flight only, changes nothing
+sdl rollover run --all --reason "root password rotation"
+sdl audit --run <run id>
+sdl audit --verify
+```
+
+### Preparing a Linux VM
+
+Create the service account and allow it to run `chpasswd`, and nothing else:
+
+```bash
+useradd -m -s /bin/bash sdl-svc
+install -d -m 700 -o sdl-svc -g sdl-svc ~sdl-svc/.ssh
+echo "<SDL's public key>" > ~sdl-svc/.ssh/authorized_keys
+chown sdl-svc:sdl-svc ~sdl-svc/.ssh/authorized_keys && chmod 600 ~sdl-svc/.ssh/authorized_keys
+echo 'sdl-svc ALL=(root) NOPASSWD: /usr/sbin/chpasswd' > /etc/sudoers.d/sdl-svc
+chmod 440 /etc/sudoers.d/sdl-svc
+```
+
+Add each VM's host key to the `known_hosts` file SDL is configured with.
+
+## Development
+
+```bash
+pip install -e '.[dev]'
+ruff check . && ruff format --check . && mypy
+pytest                                  # unit tests
+SDL_INTEGRATION=1 pytest -m integration # needs Docker: dev Vault + 3 SSH test VMs
+```
+
+## License
+
+SDL is licensed under the [GNU Affero General Public License v3.0](LICENSE).
+If you run a modified SDL as a network service, you must offer its source to
+its users.

@@ -1,0 +1,86 @@
+[build-system]
+requires = ["hatchling>=1.24"]
+build-backend = "hatchling.build"
+
+[project]
+name = "sooperdooperlooper"
+version = "0.1.0"
+description = "SooperDooperLooper (SDL): a modular orchestrator for password, API key and secret rollovers."
+readme = "README.md"
+license = "AGPL-3.0-only"
+license-files = ["LICENSE"]
+requires-python = ">=3.11"
+authors = [{ name = "SooperDooperLooper contributors" }]
+classifiers = [
+    "Development Status :: 2 - Pre-Alpha",
+    "Intended Audience :: System Administrators",
+    "License :: OSI Approved :: GNU Affero General Public License v3",
+    "Programming Language :: Python :: 3",
+    "Topic :: Security",
+    "Topic :: System :: Systems Administration",
+]
+dependencies = [
+    "asyncssh>=2.14",
+    "fastapi>=0.110",
+    "httpx>=0.27",
+    "pydantic>=2.6",
+    "pyyaml>=6.0",
+    "uvicorn>=0.29",
+]
+
+[project.optional-dependencies]
+dev = [
+    "mypy>=1.10",
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+    "ruff>=0.5",
+    "types-PyYAML",
+]
+
+[project.scripts]
+sdl = "sdl.cli.main:main"
+
+# Every module SDL ships is registered here, the same way a third-party
+# package would register its own modules.
+[project.entry-points."sdl.modules"]
+"audit.jsonl" = "sdl.modules.audit_jsonl:JsonlAuditModule"
+"auth.static_token" = "sdl.modules.auth_static_token:StaticTokenAuthModule"
+"generator.password" = "sdl.modules.generator_password:PasswordGeneratorModule"
+"secrets.vault" = "sdl.modules.secrets_vault:VaultKV2SecretsModule"
+"target.ssh_linux" = "sdl.modules.target_ssh_linux:SshLinuxTargetModule"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/sdl"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+markers = ["integration: needs Docker (Vault dev server and SSH test VMs); run with SDL_INTEGRATION=1"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "S", "ASYNC", "RUF"]
+# B027: optional lifecycle hooks on module base classes are intentionally empty.
+# ASYNC109: API callers pass the wait timeout explicitly.
+ignore = ["S101", "B027", "ASYNC109"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["S105", "S106", "S108", "S603", "S607"]
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+packages = ["sdl"]
+mypy_path = "src"
+# Module lookups take abstract contract classes (all_of(AuditModule)) on purpose.
+disable_error_code = ["type-abstract"]
+
+[[tool.mypy.overrides]]
+module = ["asyncssh.*"]
+ignore_missing_imports = true
