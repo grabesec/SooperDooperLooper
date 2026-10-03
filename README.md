@@ -28,6 +28,14 @@ by system, date range, action type and user (`sdl logs`, or the Log section of
 the web page) and which SDL can forward to syslog, Graylog or Splunk. See
 [docs/logs.md](docs/logs.md).
 
+People sign in as the **superuser** (a name and password hash kept in its own
+file), as **users** an administrator adds (password plus an authenticator
+app), or with their **Active Directory / LDAP** account or **single sign-on**
+(Entra ID and other OpenID Connect providers, SAML). Each user gets roles
+(what they may do) and inventory groups and individual systems (where), and
+sees, rolls over and reads the log of only those systems. See
+[docs/users.md](docs/users.md).
+
 ## Design
 
 SDL's backend is an **orchestrator**: a thin core that loads modules and runs
@@ -37,17 +45,18 @@ discovered through Python entry points, so third parties can ship their own.
 | Kind        | Job                                           | Shipped module                                   |
 |-------------|-----------------------------------------------|--------------------------------------------------|
 | `audit`     | Persist every system and user action          | `audit.jsonl`: hash-chained, tamper-evident file  |
-| `auth`      | Identify API callers                          | `auth.static_token`: hashed bearer tokens         |
+| `auth`      | Identify machine clients (API tokens)         | `auth.static_token`: hashed bearer tokens         |
 | `forwarder` | Ship the audit log to a log concentrator      | `forwarder.syslog` (RFC 5424, UDP/TCP/TLS), `forwarder.gelf` (Graylog), `forwarder.splunk_hec` (Splunk) |
 | `generator` | Produce new credentials                       | `generator.password`: CSPRNG password policy      |
+| `idp`       | Sign people in with an outside directory      | `idp.ldap` (Active Directory, LDAP), `idp.oidc` (Entra ID, Okta, Keycloak, Google), `idp.saml` (AD FS, Shibboleth, ...) |
 | `inventory` | Know the systems to roll over                 | `inventory.store`: SDL's own, editable via the API; `inventory.netbox`: read from NetBox |
 | `secrets`   | Store credentials in a secret manager         | `secrets.vault`: HashiCorp Vault KV v2            |
 | `target`    | Change and verify a credential on a system    | `target.ssh_linux`: Linux accounts over SSH       |
+| `users`     | Keep SDL's users and what they are assigned   | `users.store`: a private file on the SDL server    |
 
 All clients talk to the core through its HTTP API: the bundled `sdl` CLI and
 a minimal web page (at `/ui/`) today, and a full web GUI and an MCP server (so
-LLMs can drive SDL) later. User management (OIDC, Entra ID, ...) arrives as
-further `auth` modules.
+LLMs can drive SDL) later.
 
 See [docs/architecture.md](docs/architecture.md) for the module contract and
 [docs/rollover.md](docs/rollover.md) for exactly what happens during a rollover
@@ -58,9 +67,9 @@ and how SDL makes sure a password is never lost.
 Requires Python 3.11+.
 
 ```bash
-pip install .            # from a checkout; installs the `sdl` command
+pip install .            # from a checkout; add [ldap,oidc,saml] for directories / SSO
 cp examples/sdl.yaml sdl.yaml
-sdl token new --id alice --role operator   # paste the printed entry into sdl.yaml
+sdl superuser set -f /etc/sdl/superuser.json --name sdladmin   # asks for a password
 sdl check-config -c sdl.yaml
 VAULT_TOKEN=... sdl serve -c sdl.yaml      # API on http://127.0.0.1:8800
 ```
@@ -68,9 +77,10 @@ VAULT_TOKEN=... sdl serve -c sdl.yaml      # API on http://127.0.0.1:8800
 In another shell:
 
 ```bash
-export SDL_TOKEN=<the token printed by `sdl token new`>
+sdl login -u sdladmin
+sdl users add alice --role operator --group web      # asks for her first password
 sdl systems add web3 --inventory inventory --fqdn web3.example.com --ip 10.0.0.13 \
-    --secret-path linux/web3/root            # needs an admin token
+    --secret-path linux/web3/root
 sdl systems list
 sdl rollover run -i --reason "test" --dry-run      # pick systems from a numbered list
 sdl rollover run --all --reason "test" --dry-run   # pre-flight only, changes nothing
@@ -81,8 +91,9 @@ sdl audit --run <run id>
 sdl audit --verify
 ```
 
-Or open http://127.0.0.1:8800/ in a browser, sign in with the token, tick
-the systems and roll them over.
+Or open http://127.0.0.1:8800/ in a browser, sign in, tick the systems and
+roll them over. Scripts use API tokens instead: `sdl token new --id ci --role
+operator`, then `export SDL_TOKEN=...`.
 
 ### Preparing a Linux VM
 

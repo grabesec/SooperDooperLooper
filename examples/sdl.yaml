@@ -28,16 +28,49 @@ modules:
   #     index: security
   #     exclude_actions: [api.request]   # skip read-only API calls
 
-  # API clients. Create entries with: sdl token new --id <name> --role operator
-  auth:
-    type: auth.static_token
+  # SDL's users: local accounts (password + TOTP) and records of directory
+  # users. Manage them with `sdl users ...` or on the web page. See docs/users.md.
+  users:
+    type: users.store
     config:
-      clients:
-        - id: admin
-          display_name: SDL administrator
-          # Placeholder; replace with the hash printed by `sdl token new`.
-          token_sha256: "0000000000000000000000000000000000000000000000000000000000000000"
-          roles: [admin]
+      path: /var/lib/sdl/users.json
+
+  # Sign in with Active Directory accounts; groups decide roles and systems.
+  # ad:
+  #   type: idp.ldap
+  #   config:
+  #     display_name: Contoso AD
+  #     directory: active_directory
+  #     urls: [ldaps://dc1.contoso.com]
+  #     bind_dn: sdl-search@contoso.com
+  #     bind_password_env: SDL_LDAP_PASSWORD
+  #     user_base_dn: OU=Staff,DC=contoso,DC=com
+  #     group_base_dn: OU=Groups,DC=contoso,DC=com
+  #     group_mapping:
+  #       - {group: SDL-Admins, roles: [admin], all_systems: true}
+  #       - {group: Web-Operators, roles: [operator], groups: [web]}
+
+  # Single sign-on with Microsoft Entra ID (or Okta, Keycloak, Google...).
+  # entra:
+  #   type: idp.oidc
+  #   config:
+  #     display_name: Entra ID
+  #     issuer: https://login.microsoftonline.com/<tenant id>/v2.0
+  #     client_id: <application id>
+  #     client_secret_env: SDL_OIDC_SECRET
+  #     group_mapping:
+  #       - {group: <group object id>, roles: [auditor], all_systems: true}
+
+  # API tokens for scripts and other machine clients.
+  # Create entries with: sdl token new --id <name> --role operator
+  # auth:
+  #   type: auth.static_token
+  #   config:
+  #     clients:
+  #       - id: ci
+  #         token_sha256: "<hash printed by sdl token new>"
+  #         roles: [operator]
+  #         access: {groups: [web]}
 
   # SDL's own inventory of systems (hostnames, FQDNs, IPs, service accounts).
   # Add systems with `sdl systems add ... --inventory inventory` or on the web page.
@@ -105,3 +138,14 @@ targets:
 
 rollover:
   max_parallel: 5
+
+identity:
+  # Create with: sdl superuser set -f /etc/sdl/superuser.json --name sdladmin
+  superuser_file: /etc/sdl/superuser.json
+  require_mfa: true          # local users must set up an authenticator app
+  # session_ttl: 28800       # seconds a sign-in lasts at most
+  # session_idle: 3600       # ... and without activity
+  # max_failed_logins: 5
+  # lockout: 900
+# api:
+#   public_url: https://sdl.example.com   # for single sign-on behind a reverse proxy

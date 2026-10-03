@@ -149,6 +149,15 @@ def test_config_errors_are_caught_at_load(tmp_path: Path) -> None:
         make_settings(tmp_path, targets=[{"name": "a", "host": "a"}, {"name": "a", "host": "b"}])
 
 
-def test_example_config_is_valid() -> None:
+def test_example_config_is_valid(tmp_path: Path) -> None:
+    from sdl.core import superuser
+    from sdl.core.passwords import hash_password
+
     example = Path(__file__).parents[2] / "examples" / "sdl.yaml"
-    Orchestrator(Settings.load(example)).load()
+    settings = Settings.load(example)
+    assert settings.identity.superuser_file is not None
+    # The example points at /etc/sdl; use a superuser file made the way the docs say.
+    path = tmp_path / "superuser.json"
+    superuser.save(path, superuser.Superuser(name="sdladmin", password_hash=hash_password("x")))
+    settings.identity.superuser_file = path
+    Orchestrator(settings).load()

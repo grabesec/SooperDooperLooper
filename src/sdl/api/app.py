@@ -9,37 +9,63 @@ from contextlib import asynccontextmanager, contextmanager
 from datetime import datetime
 from importlib.resources import files
 from typing import Annotated, Any, Literal
+from urllib.parse import parse_qs, quote, urlencode
 
-from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response, status
+from fastapi import Body, Depends, FastAPI, HTTPException, Query, Request, Response, status
 from fastapi.responses import RedirectResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, SecretStr
 
 from sdl import __version__
+from sdl.core.errors import (
+    AuthenticationError,
+    ConflictError,
+    ForbiddenError,
+    NotFoundError,
+    ProviderUnavailableError,
+    RequestError,
+)
 from sdl.core.forwarding import ForwarderStatus
+from sdl.core.identity import (
+    LoginResult,
+    Me,
+    ProviderInfo,
+    TotpEnrollment,
+    UserCreate,
+    UserUpdate,
+)
 from sdl.core.models import (
+    Access,
     Actor,
     AuditEvent,
     AuditFacets,
     AuditQuery,
+    ExternalIdentity,
     Inventory,
     InventorySource,
     Outcome,
     RolloverRequest,
     RolloverRun,
     TargetSpec,
+    UserView,
 )
 from sdl.core.module import ModuleError
-from sdl.core.orchestrator import ConflictError, NotFoundError, Orchestrator, RequestError
+from sdl.core.orchestrator import Orchestrator
 from sdl.core.permissions import (
+    ASSIGNABLE_ROLES,
     AUDIT_READ,
     INVENTORY_WRITE,
     MODULES_READ,
-    ROLE_PERMISSIONS,
     ROLLOVER_READ,
     ROLLOVER_RUN,
+    SELF,
     TARGETS_READ,
+    USERS_READ,
+    USERS_WRITE,
     allowed,
 )
+
+MAX_CALLBACK_BODY = 1_000_000
+"""Largest single sign-on answer (a SAML response) the callback accepts, in bytes."""
 
 UI_FILES = {
     "index.html": "text/html; charset=utf-8",
@@ -70,8 +96,47 @@ class AuditVerification(BaseModel):
     detail: str
 
 
-class Me(BaseModel):
-    actor: Actor
+class LoginRequest(BaseModel):
+    username: str = Field(max_length=255)
+    password: SecretStr
+    code: str | None = Field(default=None, max_length=16, description="TOTP code, when asked.")
+    provider: str | None = Field(
+        default=None, description="'local' (default) or a password identity provider id."
+    )
+
+
+class CodeExchange(BaseModel):
+    code: str = Field(max_length=128)
+
+
+class PasswordChange(BaseModel):
+    current_password: SecretStr
+    new_password: SecretStr
+
+
+class PasswordSet(BaseModel):
+    password: SecretStr
+    temporary: bool = Field(
+        default=True, description="The user must choose a new password at next sign-in."
+    )
+
+
+class TotpConfirm(BaseModel):
+    code: str = Field(max_length=16)
+
+
+class UserImport(BaseModel):
+    username: str
+    roles: list[str] = Field(default_factory=list)
+    access: Access = Field(default_factory=Access)
+
+
+class IdentityProviderInfo(ProviderInfo):
+    can_search: bool
+
+
+class RoleInfo(BaseModel):
+    name: str
     permissions: list[str]
 
 
@@ -84,10 +149,29 @@ def http_errors() -> Iterator[None]:
         raise HTTPException(status.HTTP_404_NOT_FOUND, str(exc)) from exc
     except ConflictError as exc:
         raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
+    except ForbiddenError as exc:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, str(exc)) from exc
+    except AuthenticationError as exc:
+        detail: Any = str(exc)
+        if exc.mfa_required:
+            detail = {"message": str(exc), "mfa_required": True}
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, detail) from exc
+    except ProviderUnavailableError as exc:
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, str(exc)) from exc
     except RequestError as exc:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc)) from exc
     except ModuleError as exc:
         raise HTTPException(status.HTTP_502_BAD_GATEWAY, str(exc)) from exc
+
+
+def client_of(request: Request) -> str | None:
+    return request.client.host if request.client else None
+
+
+def base_url(request: Request) -> str:
+    orchestrator: Orchestrator = request.app.state.orchestrator
+    configured = orchestrator.settings.api.public_url
+    return (configured or str(request.base_url)).rstrip("/")
 
 
 def _matches(system: TargetSpec, q: str | None, group: str | None, source: str | None) -> bool:
@@ -117,8 +201,8 @@ def require(permission: str) -> Callable[[Request], Awaitable[Actor]]:
     async def dependency(request: Request) -> Actor:
         orchestrator: Orchestrator = request.app.state.orchestrator
         where = f"{request.method} {request.url.path}"
-        client = request.client.host if request.client else None
-        actor = await orchestrator.auth_module().authenticate(request)
+        client = client_of(request)
+        actor = await orchestrator.identity.authenticate(request)
         if actor is None:
             await orchestrator.audit.record(
                 "api.authenticate", Outcome.DENIED, message=where, client=client
@@ -138,6 +222,9 @@ def require(permission: str) -> Callable[[Request], Awaitable[Actor]]:
                 client=client,
             )
             raise HTTPException(status.HTTP_403_FORBIDDEN, f"{permission} is not granted")
+        request.state.actor = actor
+        if permission == SELF:
+            return actor  # your own account: not worth an audit event per page load
         await orchestrator.audit.record(
             "api.request",
             Outcome.INFO,
@@ -147,7 +234,6 @@ def require(permission: str) -> Callable[[Request], Awaitable[Actor]]:
             client=client,
             query=request.url.query or None,
         )
-        request.state.actor = actor
         return actor
 
     return dependency
@@ -227,10 +313,234 @@ def create_app(orchestrator: Orchestrator) -> FastAPI:
         body = files("sdl.api").joinpath("ui", name).read_bytes()
         return Response(body, media_type=UI_FILES[name], headers=UI_HEADERS)
 
-    @app.get("/api/v1/me", tags=["system"])
-    async def me(actor: Annotated[Actor, Depends(require(TARGETS_READ))]) -> Me:
-        granted = set().union(*(ROLE_PERMISSIONS.get(r, frozenset()) for r in actor.roles))
-        return Me(actor=actor, permissions=sorted(granted))
+    identity = orchestrator.identity
+
+    # -- sign-in ------------------------------------------------------------------------
+
+    @app.get("/api/v1/auth/providers", tags=["auth"])
+    async def auth_providers() -> list[ProviderInfo]:
+        """How people can sign in: SDL's own form, LDAP, single sign-on providers."""
+        return identity.list_providers()
+
+    @app.post("/api/v1/auth/login", tags=["auth"])
+    async def login(body: LoginRequest, request: Request) -> LoginResult:
+        """Sign in with a user name and password (and TOTP code); returns a session token.
+
+        Answers 401 with ``{"mfa_required": true}`` when the password was right
+        and a one-time code is needed.
+        """
+        with http_errors():
+            return await identity.login(
+                body.username,
+                body.password.get_secret_value(),
+                body.code,
+                body.provider,
+                client_of(request),
+            )
+
+    @app.get("/api/v1/auth/sso/{provider}/start", tags=["auth"])
+    async def sso_start(
+        provider: str,
+        request: Request,
+        return_to: Annotated[Literal["ui", "cli"], Query()] = "ui",
+    ) -> RedirectResponse:
+        """Send the browser to the identity provider's sign-in page."""
+        with http_errors():
+            url = await identity.sso_begin(provider, _callback(request, provider), return_to)
+        return RedirectResponse(url, status_code=status.HTTP_303_SEE_OTHER)
+
+    def _callback(request: Request, provider: str) -> str:
+        return f"{base_url(request)}/api/v1/auth/sso/{quote(provider, safe='')}/callback"
+
+    @app.api_route("/api/v1/auth/sso/{provider}/callback", methods=["GET", "POST"], tags=["auth"])
+    async def sso_callback(provider: str, request: Request) -> RedirectResponse:
+        """Where the identity provider sends the browser back (query string or form post)."""
+        params = dict(request.query_params.items())
+        if request.method == "POST":
+            if int(request.headers.get("content-length") or 0) > MAX_CALLBACK_BODY:
+                raise HTTPException(status.HTTP_413_REQUEST_ENTITY_TOO_LARGE)
+            body = b""
+            async for chunk in request.stream():
+                body += chunk
+                if len(body) > MAX_CALLBACK_BODY:
+                    raise HTTPException(status.HTTP_413_REQUEST_ENTITY_TOO_LARGE)
+            params.update(
+                {k: v[0] for k, v in parse_qs(body.decode("utf-8", "replace")).items() if v}
+            )
+        try:
+            with http_errors():
+                code, return_to = await identity.sso_complete(
+                    provider, params, _callback(request, provider), client_of(request)
+                )
+        except HTTPException as exc:
+            message = exc.detail if isinstance(exc.detail, str) else "sign-in failed"
+            return RedirectResponse(
+                "/ui/#" + urlencode({"sso_error": message}), status_code=status.HTTP_303_SEE_OTHER
+            )
+        key = "cli_code" if return_to == "cli" else "sso"
+        return RedirectResponse(
+            "/ui/#" + urlencode({key: code}), status_code=status.HTTP_303_SEE_OTHER
+        )
+
+    @app.get("/api/v1/auth/sso/{provider}/metadata", tags=["auth"])
+    async def sso_metadata(provider: str, request: Request) -> Response:
+        """Service-provider metadata to register SDL with a SAML identity provider."""
+        with http_errors():
+            idp = identity.provider(provider)
+        xml = idp.metadata(_callback(request, provider))
+        if xml is None:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "this provider has no metadata")
+        return Response(xml, media_type="application/samlmetadata+xml")
+
+    @app.post("/api/v1/auth/sso/exchange", tags=["auth"])
+    async def sso_exchange(body: CodeExchange) -> LoginResult:
+        """Trade the one-time code a single sign-on handed the page for a session token."""
+        with http_errors():
+            return await identity.exchange(body.code)
+
+    @app.post("/api/v1/auth/logout", tags=["auth"], status_code=status.HTTP_204_NO_CONTENT)
+    async def logout(request: Request, actor: Annotated[Actor, Depends(require(SELF))]) -> None:
+        await identity.logout(actor, request)
+
+    # -- your own account ------------------------------------------------------------------
+
+    @app.get("/api/v1/me", tags=["me"])
+    async def me(request: Request, actor: Annotated[Actor, Depends(require(SELF))]) -> Me:
+        """Who you are, what you may do, which systems you reach, and what is pending."""
+        return await identity.me(actor, request)
+
+    @app.post("/api/v1/me/password", tags=["me"], status_code=status.HTTP_204_NO_CONTENT)
+    async def change_password(
+        body: PasswordChange, request: Request, actor: Annotated[Actor, Depends(require(SELF))]
+    ) -> None:
+        with http_errors():
+            await identity.change_own_password(
+                actor,
+                request,
+                body.current_password.get_secret_value(),
+                body.new_password.get_secret_value(),
+            )
+
+    @app.post("/api/v1/me/mfa/totp", tags=["me"])
+    async def begin_totp(
+        request: Request, actor: Annotated[Actor, Depends(require(SELF))]
+    ) -> TotpEnrollment:
+        """Start setting up an authenticator app; confirm it with a code to finish."""
+        with http_errors():
+            return await identity.begin_totp(actor, request)
+
+    @app.post("/api/v1/me/mfa/totp/confirm", tags=["me"], status_code=status.HTTP_204_NO_CONTENT)
+    async def confirm_totp(
+        body: TotpConfirm, request: Request, actor: Annotated[Actor, Depends(require(SELF))]
+    ) -> None:
+        with http_errors():
+            await identity.confirm_totp(actor, request, body.code)
+
+    # -- user management -----------------------------------------------------------------
+
+    @app.get("/api/v1/roles", tags=["users"])
+    async def list_roles(_: Annotated[Actor, Depends(require(SELF))]) -> list[RoleInfo]:
+        from sdl.core.permissions import ROLE_PERMISSIONS
+
+        return [
+            RoleInfo(name=name, permissions=sorted(ROLE_PERMISSIONS[name]))
+            for name in sorted(ASSIGNABLE_ROLES)
+        ]
+
+    @app.get("/api/v1/users", tags=["users"])
+    async def list_users(_: Annotated[Actor, Depends(require(USERS_READ))]) -> list[UserView]:
+        with http_errors():
+            return await identity.list_users()
+
+    @app.post("/api/v1/users", tags=["users"], status_code=status.HTTP_201_CREATED)
+    async def create_user(
+        body: UserCreate, actor: Annotated[Actor, Depends(require(USERS_WRITE))]
+    ) -> UserView:
+        """Add a local user, with roles and the inventory groups and systems they may reach."""
+        with http_errors():
+            return await identity.create_user(actor, body)
+
+    @app.get("/api/v1/users/{name}", tags=["users"])
+    async def get_user(name: str, _: Annotated[Actor, Depends(require(USERS_READ))]) -> UserView:
+        with http_errors():
+            return await identity.get_user(name)
+
+    @app.patch("/api/v1/users/{name}", tags=["users"])
+    async def update_user(
+        name: str, body: UserUpdate, actor: Annotated[Actor, Depends(require(USERS_WRITE))]
+    ) -> UserView:
+        """Change a user's details, roles, assigned groups and systems, or enable/disable them."""
+        with http_errors():
+            return await identity.update_user(actor, name, body)
+
+    @app.delete("/api/v1/users/{name}", tags=["users"], status_code=status.HTTP_204_NO_CONTENT)
+    async def delete_user(
+        name: str, actor: Annotated[Actor, Depends(require(USERS_WRITE))]
+    ) -> None:
+        with http_errors():
+            await identity.delete_user(actor, name)
+
+    @app.post(
+        "/api/v1/users/{name}/password", tags=["users"], status_code=status.HTTP_204_NO_CONTENT
+    )
+    async def set_password(
+        name: str, body: PasswordSet, actor: Annotated[Actor, Depends(require(USERS_WRITE))]
+    ) -> None:
+        """Set a local user's password; by default they must change it at next sign-in."""
+        with http_errors():
+            await identity.set_password(
+                actor, name, body.password.get_secret_value(), body.temporary
+            )
+
+    @app.delete("/api/v1/users/{name}/mfa", tags=["users"], status_code=status.HTTP_204_NO_CONTENT)
+    async def reset_mfa(name: str, actor: Annotated[Actor, Depends(require(USERS_WRITE))]) -> None:
+        """Remove a user's authenticator (lost phone); they set up a new one at next sign-in."""
+        with http_errors():
+            await identity.reset_mfa(actor, name)
+
+    @app.post("/api/v1/users/{name}/unlock", tags=["users"], status_code=status.HTTP_204_NO_CONTENT)
+    async def unlock_user(
+        name: str, actor: Annotated[Actor, Depends(require(USERS_WRITE))]
+    ) -> None:
+        """Clear a lockout after too many failed sign-ins."""
+        with http_errors():
+            await identity.unlock(actor, name)
+
+    @app.get("/api/v1/idps", tags=["users"])
+    async def list_idps(
+        _: Annotated[Actor, Depends(require(USERS_READ))],
+    ) -> list[IdentityProviderInfo]:
+        """Identity-provider modules (LDAP / Active Directory, Entra ID and other OIDC, SAML)."""
+        return [
+            IdentityProviderInfo(
+                **info.model_dump(), can_search=identity.providers[info.id].can_search
+            )
+            for info in identity.list_providers()
+            if info.id in identity.providers
+        ]
+
+    @app.get("/api/v1/idps/{provider}/users", tags=["users"])
+    async def search_directory(
+        provider: str,
+        actor: Annotated[Actor, Depends(require(USERS_WRITE))],
+        q: Annotated[str, Query(max_length=200)] = "",
+        limit: Annotated[int, Query(ge=1, le=500)] = 50,
+    ) -> list[ExternalIdentity]:
+        """Look users up in a directory (LDAP / Active Directory) to add them to SDL."""
+        with http_errors():
+            return await identity.search_directory(actor, provider, q, limit)
+
+    @app.post("/api/v1/idps/{provider}/users", tags=["users"], status_code=status.HTTP_201_CREATED)
+    async def import_user(
+        provider: str,
+        actor: Annotated[Actor, Depends(require(USERS_WRITE))],
+        body: Annotated[UserImport, Body()],
+    ) -> UserView:
+        """Add a directory user to SDL before their first sign-in, with roles and access."""
+        with http_errors():
+            return await identity.import_user(
+                actor, provider, body.username, body.roles, body.access
+            )
 
     @app.get("/api/v1/modules", tags=["system"])
     async def list_modules(
@@ -254,29 +564,30 @@ def create_app(orchestrator: Orchestrator) -> FastAPI:
 
     @app.get("/api/v1/systems", tags=["inventory"])
     async def list_systems(
-        _: Annotated[Actor, Depends(require(TARGETS_READ))],
+        actor: Annotated[Actor, Depends(require(TARGETS_READ))],
         q: Annotated[str | None, Query(description="Words to match in any field.")] = None,
         group: str | None = None,
         source: Annotated[str | None, Query(description="Only this inventory.")] = None,
     ) -> Inventory:
-        """Every system from every inventory, with each inventory's status."""
-        inventory = await orchestrator.inventory()
+        """Every system assigned to the caller, from every inventory, with each inventory's
+        status."""
+        inventory = await orchestrator.visible_inventory(actor)
         inventory.systems = [s for s in inventory.systems if _matches(s, q, group, source)]
         return inventory
 
     @app.get("/api/v1/systems/{name}", tags=["inventory"])
     async def get_system(
-        name: str, _: Annotated[Actor, Depends(require(TARGETS_READ))]
+        name: str, actor: Annotated[Actor, Depends(require(TARGETS_READ))]
     ) -> TargetSpec:
         with http_errors():
-            return await orchestrator.get_system(name)
+            return await orchestrator.get_system(name, actor)
 
     @app.get("/api/v1/targets", tags=["inventory"])
     async def list_targets(
-        _: Annotated[Actor, Depends(require(TARGETS_READ))],
+        actor: Annotated[Actor, Depends(require(TARGETS_READ))],
     ) -> list[TargetSpec]:
         """Every system, without inventory status (kept for older clients)."""
-        return (await orchestrator.inventory()).systems
+        return (await orchestrator.visible_inventory(actor)).systems
 
     @app.get("/api/v1/inventory", tags=["inventory"])
     async def list_inventories(
@@ -298,7 +609,10 @@ def create_app(orchestrator: Orchestrator) -> FastAPI:
         body: TargetSpec,
         actor: Annotated[Actor, Depends(require(INVENTORY_WRITE))],
     ) -> TargetSpec:
-        """Add a system to a writable inventory, or replace it."""
+        """Add a system to a writable inventory, or replace it.
+
+        Callers limited to some groups and systems can only store systems within them.
+        """
         if body.name != name:
             raise HTTPException(status.HTTP_400_BAD_REQUEST, "name in the body and URL differ")
         with http_errors():
@@ -331,27 +645,29 @@ def create_app(orchestrator: Orchestrator) -> FastAPI:
                 run = await orchestrator.wait(run.id, timeout)
             except TimeoutError:
                 pass  # still running; the caller polls GET /rollovers/{id}
-        return run
+        return orchestrator.visible_run(run, actor) or run
 
     @app.get("/api/v1/rollovers", tags=["rollovers"])
     async def list_rollovers(
-        _: Annotated[Actor, Depends(require(ROLLOVER_READ))],
+        actor: Annotated[Actor, Depends(require(ROLLOVER_READ))],
     ) -> list[RolloverRun]:
-        return sorted(orchestrator.runs.values(), key=lambda r: r.created_at, reverse=True)
+        """Runs, newest first; each shows only the systems assigned to the caller."""
+        return orchestrator.visible_runs(actor)
 
     @app.get("/api/v1/rollovers/{run_id}", tags=["rollovers"])
     async def get_rollover(
         run_id: str,
-        _: Annotated[Actor, Depends(require(ROLLOVER_READ))],
+        actor: Annotated[Actor, Depends(require(ROLLOVER_READ))],
     ) -> RolloverRun:
         run = orchestrator.runs.get(run_id)
+        run = orchestrator.visible_run(run, actor) if run is not None else None
         if run is None:
             raise HTTPException(status.HTTP_404_NOT_FOUND, "no such rollover run")
         return run
 
     @app.get("/api/v1/audit", tags=["audit"])
     async def query_audit(
-        _: Annotated[Actor, Depends(require(AUDIT_READ))],
+        caller: Annotated[Actor, Depends(require(AUDIT_READ))],
         target: Annotated[
             list[str] | None, Query(description="System (resource) name; repeatable.")
         ] = None,
@@ -374,7 +690,10 @@ def create_app(orchestrator: Orchestrator) -> FastAPI:
             Literal["oldest", "newest"], Query(description="Order of the returned events.")
         ] = "oldest",
     ) -> list[AuditEvent]:
-        """The ``limit`` most recent events matching every filter given."""
+        """The ``limit`` most recent events matching every filter given.
+
+        Callers limited to some systems see events about those systems and their own actions.
+        """
         query = AuditQuery(
             targets=target or [],
             modules=module or [],
@@ -388,14 +707,17 @@ def create_app(orchestrator: Orchestrator) -> FastAPI:
             limit=limit,
             newest_first=order == "newest",
         )
+        query = await orchestrator.audit_scope(caller, query)
         return await orchestrator.audit.primary.query(query)
 
     @app.get("/api/v1/audit/facets", tags=["audit"])
     async def audit_facets(
-        _: Annotated[Actor, Depends(require(AUDIT_READ))],
+        actor: Annotated[Actor, Depends(require(AUDIT_READ))],
     ) -> AuditFacets:
         """Systems, modules, action types and actors found in the log, to filter by."""
-        return await orchestrator.audit.primary.facets()
+        query = await orchestrator.audit_scope(actor, AuditQuery())
+        scoped = query if query.scope_targets is not None else None
+        return await orchestrator.audit.primary.facets(scoped)
 
     @app.get("/api/v1/forwarders", tags=["audit"])
     async def forwarders(

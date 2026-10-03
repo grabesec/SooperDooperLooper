@@ -12,8 +12,18 @@ import logging
 from typing import TypeVar
 
 from sdl.core.audit import AuditRecorder
+from sdl.core.errors import (
+    ConfigError,
+    ConflictError,
+    ForbiddenError,
+    NotFoundError,
+    RequestError,
+)
+from sdl.core.identity import Identity
 from sdl.core.models import (
+    Access,
     Actor,
+    AuditQuery,
     Inventory,
     InventorySource,
     Outcome,
@@ -30,11 +40,13 @@ from sdl.core.module import (
     AuthModule,
     ForwarderModule,
     GeneratorModule,
+    IdentityProviderModule,
     InventoryModule,
     Module,
     ModuleContext,
     SecretsModule,
     TargetModule,
+    UserStoreModule,
 )
 from sdl.core.registry import ModuleRegistry
 from sdl.core.rollover import rollover_target
@@ -49,22 +61,6 @@ CONFIG_INVENTORY = "sdl.yaml"
 """Inventory id of the systems listed under ``targets:`` in the configuration file."""
 
 
-class ConfigError(ValueError):
-    pass
-
-
-class RequestError(ValueError):
-    """The caller asked for something that cannot be done (unknown target, busy target...)."""
-
-
-class NotFoundError(RequestError):
-    """The caller named a system or inventory that does not exist."""
-
-
-class ConflictError(RequestError):
-    """The request clashes with the current state (a busy system, a duplicate name...)."""
-
-
 class Orchestrator:
     def __init__(self, settings: Settings, registry: ModuleRegistry | None = None) -> None:
         self.settings = settings
@@ -76,6 +72,8 @@ class Orchestrator:
         self._busy_targets: set[str] = set()
         self._inventory_down: dict[str, str] = {}
         self._started = False
+        self._identity: Identity | None = None
+        self._run_systems: dict[str, dict[str, list[str]]] = {}
 
     # -- lifecycle -----------------------------------------------------------
 
@@ -97,6 +95,21 @@ class Orchestrator:
         self.audit.attach(audit_modules)
         self.audit.forwarding.attach(self.all_of(ForwarderModule), self._forwarder_status)
         self._validate()
+        users = self.all_of(UserStoreModule)
+        if self.settings.identity.users is not None or len(users) > 1:
+            users = [self.one_of(UserStoreModule, self.settings.identity.users)]
+        auth_modules = self.all_of(AuthModule)
+        if self.settings.api.auth is not None:
+            auth_modules = [self.one_of(AuthModule, self.settings.api.auth)]
+        self._identity = Identity(
+            self.settings.identity,
+            self.settings.api,
+            self.audit,
+            users[0] if users else None,
+            self.all_of(IdentityProviderModule),
+            auth_modules,
+            {i: s.type for i, s in self.settings.modules.items()},
+        )
 
     async def start(self) -> None:
         self.load()
@@ -198,8 +211,11 @@ class Orchestrator:
             )
         return candidates[0]
 
-    def auth_module(self) -> AuthModule:
-        return self.one_of(AuthModule, self.settings.api.auth)
+    @property
+    def identity(self) -> Identity:
+        if self._identity is None:
+            raise ConfigError("the orchestrator has not been loaded")
+        return self._identity
 
     def check_system(self, system: TargetSpec) -> list[str]:
         """Return what stops ``system`` from being rolled over with the configured modules."""
@@ -316,12 +332,46 @@ class Orchestrator:
                 systems=source.systems,
             )
 
-    async def get_system(self, name: str) -> TargetSpec:
+    async def visible_inventory(self, actor: Actor) -> Inventory:
+        """The inventory as ``actor`` may see it: only the systems assigned to them."""
+        inventory = await self.inventory()
+        inventory.systems = [s for s in inventory.systems if actor.permits(s)]
+        return inventory
+
+    async def get_system(self, name: str, actor: Actor | None = None) -> TargetSpec:
         inventory = await self.inventory()
         for system in inventory.systems:
-            if system.name == name:
+            if system.name == name and (actor is None or actor.permits(system)):
                 return system
         raise NotFoundError(f"no system named {name!r}{_unavailable(inventory)}")
+
+    async def audit_scope(self, actor: Actor, query: AuditQuery) -> AuditQuery:
+        """Limit an audit query to what ``actor`` may see: events about their systems, and
+        their own actions."""
+        if actor.access is None or actor.access.all_systems:
+            return query
+        systems = (await self.visible_inventory(actor)).systems
+        return query.model_copy(
+            update={"scope_targets": [s.name for s in systems], "scope_actors": [actor.id]}
+        )
+
+    def visible_runs(self, actor: Actor) -> list[RolloverRun]:
+        """Rollover runs, newest first, showing ``actor`` only the systems assigned to them."""
+        runs = sorted(self.runs.values(), key=lambda r: r.created_at, reverse=True)
+        return [v for v in (self.visible_run(r, actor) for r in runs) if v is not None]
+
+    def visible_run(self, run: RolloverRun, actor: Actor) -> RolloverRun | None:
+        if actor.access is None or actor.access.all_systems:
+            return run
+        allowed = {
+            name
+            for name, groups in self._run_systems.get(run.id, {}).items()
+            if _permits(actor.access, name, groups)
+        }
+        results = [r for r in run.results if r.target in allowed]
+        if not results and run.requested_by.id != actor.id:
+            return None
+        return run.model_copy(update={"results": results})
 
     async def put_system(self, inventory_id: str, system: TargetSpec, actor: Actor) -> TargetSpec:
         """Add or replace a system in a writable inventory, after checking it is usable."""
@@ -332,8 +382,15 @@ class Orchestrator:
         problems = self.check_system(system)
         if problems:
             raise RequestError(f"system {system.name!r}: {'; '.join(problems)}")
+        if not actor.permits(system):
+            raise ForbiddenError(
+                f"system {system.name!r} would be outside the groups and systems assigned to you"
+            )
         current = await self.inventory()
-        elsewhere = [s.source for s in current.systems if s.name == system.name]
+        existing = [s for s in current.systems if s.name == system.name]
+        if existing and not actor.permits(existing[0]):
+            raise ConflictError(f"a system named {system.name!r} already exists")
+        elsewhere = [s.source for s in existing]
         if elsewhere and elsewhere[0] != inventory_id:
             raise ConflictError(
                 f"a system named {system.name!r} already comes from inventory {elsewhere[0]!r}"
@@ -367,6 +424,10 @@ class Orchestrator:
         module = self.inventory_module(inventory_id)
         if not module.writable:
             raise RequestError(f"inventory {inventory_id!r} is read-only")
+        if actor.access is not None:
+            current = [s for s in (await module.list_systems()) if s.name == name]
+            if current and not actor.permits(current[0]):
+                raise NotFoundError(f"inventory {inventory_id!r} has no system named {name!r}")
         if name in self._busy_targets:
             raise ConflictError(f"rollover in progress for {name!r}; try again later")
         try:
@@ -413,9 +474,16 @@ class Orchestrator:
         )
         return inventory
 
-    async def select_targets(self, request: RolloverRequest) -> list[TargetSpec]:
+    async def select_targets(
+        self, request: RolloverRequest, actor: Actor | None = None
+    ) -> list[TargetSpec]:
+        """The systems a rollover request names, among those ``actor`` may reach.
+
+        Systems outside the caller's assignments are reported as unknown, so
+        their names are not revealed.
+        """
         inventory = await self.inventory()
-        systems = inventory.systems
+        systems = [s for s in inventory.systems if actor is None or actor.permits(s)]
         by_name = {t.name: t for t in systems}
         unknown = [name for name in request.targets if name not in by_name]
         if unknown:
@@ -441,7 +509,7 @@ class Orchestrator:
     # -- rollovers -----------------------------------------------------------
 
     async def start_rollover(self, request: RolloverRequest, actor: Actor) -> RolloverRun:
-        targets = await self.select_targets(request)
+        targets = await self.select_targets(request, actor)
         busy = [t.name for t in targets if t.name in self._busy_targets]
         if busy:
             raise ConflictError(f"rollover already in progress for: {', '.join(busy)}")
@@ -462,6 +530,7 @@ class Orchestrator:
         )
         self._busy_targets.update(t.name for t in targets)
         self.runs[run.id] = run
+        self._run_systems[run.id] = {t.name: list(t.groups) for t in targets}
         try:
             await self.audit.record(
                 "rollover.requested",
@@ -475,6 +544,7 @@ class Orchestrator:
         except Exception:
             self._busy_targets.difference_update(t.name for t in targets)
             del self.runs[run.id]
+            del self._run_systems[run.id]
             raise
         self._tasks[run.id] = asyncio.create_task(self._execute(run, targets), name=f"run-{run.id}")
         return run
@@ -547,6 +617,10 @@ class Orchestrator:
                 )
             except Exception:
                 log.exception("could not record the end of run %s", run.id)
+
+
+def _permits(access: Access, name: str, groups: list[str]) -> bool:
+    return access.all_systems or name in access.systems or any(g in access.groups for g in groups)
 
 
 def _describe(exc: BaseException) -> str:
