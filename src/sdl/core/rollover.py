@@ -2,7 +2,9 @@
 
 The order of steps is chosen so a credential is never lost:
 
-1. connect and run pre-flight checks (nothing changed yet)
+1. read the system's service account credential from the secrets module, if
+   the system names one, then connect and run pre-flight checks (nothing
+   changed yet)
 2. read the current credential from the secrets module (used for rollback)
 3. generate the new credential and escrow it at a staging path in the
    secrets module *before* touching the target
@@ -29,6 +31,7 @@ from sdl.core.models import (
     Outcome,
     RolloverRun,
     SecretRecord,
+    ServiceCredential,
     StepResult,
     TargetResult,
     TargetSpec,
@@ -53,11 +56,13 @@ class _Rollover:
         result: TargetResult,
         target_module: TargetModule,
         secrets: SecretsModule,
+        service_secrets: SecretsModule | None,
         generator: GeneratorModule,
         audit: AuditRecorder,
         staging_suffix: str,
     ) -> None:
         self.run = run
+        self.service_secrets = service_secrets
         self.target = target
         self.result = result
         self.target_module = target_module
@@ -111,8 +116,14 @@ class _Rollover:
         self.result.started_at = utcnow()
         await self.step("start", Outcome.STARTED, dry_run=self.run.dry_run)
 
+        credential: ServiceCredential | None = None
+        if self.target.service_account is not None:
+            credential = await self._service_credential()
+            if credential is None:
+                return
+
         try:
-            session = await self.target_module.open_session(self.target)
+            session = await self.target_module.open_session(self.target, credential)
         except Exception as exc:
             await self.step("connect", Outcome.FAILURE, _describe(exc))
             await self.finish(TargetStatus.FAILED, f"could not connect: {_describe(exc)}")
@@ -121,6 +132,39 @@ class _Rollover:
 
         async with session:
             await self._with_session(session)
+
+    async def _service_credential(self) -> ServiceCredential | None:
+        account = self.target.service_account
+        assert account is not None and self.service_secrets is not None
+        try:
+            record = await self.service_secrets.read(account.credential_path)
+        except Exception as exc:
+            await self.step("service_account", Outcome.FAILURE, _describe(exc))
+            await self.finish(
+                TargetStatus.FAILED,
+                f"could not read the service account credential: {_describe(exc)}",
+            )
+            return None
+        if record is None:
+            message = (
+                f"no credential for service account {account.username!r} at "
+                f"{account.credential_path} in {self.service_secrets.instance_id}"
+            )
+            await self.step("service_account", Outcome.FAILURE, message)
+            await self.finish(TargetStatus.FAILED, message)
+            return None
+        await self.step(
+            "service_account",
+            Outcome.SUCCESS,
+            f"signing in as {account.username}",
+            credential_path=account.credential_path,
+            credential_type=account.credential_type,
+        )
+        return ServiceCredential(
+            username=account.username,
+            credential_type=account.credential_type,
+            secret=record.value,
+        )
 
     async def _with_session(self, session: TargetSession) -> None:
         # Phase 1: nothing has changed yet, so any failure leaves the target as it was.
@@ -302,6 +346,7 @@ async def rollover_target(
     result: TargetResult,
     target_module: TargetModule,
     secrets: SecretsModule,
+    service_secrets: SecretsModule | None,
     generator: GeneratorModule,
     audit: AuditRecorder,
     staging_suffix: str,
@@ -312,6 +357,7 @@ async def rollover_target(
         result=result,
         target_module=target_module,
         secrets=secrets,
+        service_secrets=service_secrets,
         generator=generator,
         audit=audit,
         staging_suffix=staging_suffix,

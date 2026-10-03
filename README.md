@@ -13,10 +13,15 @@ $ sdl rollover run --group web --reason "quarterly rotation"
 Run 3f9c... (rollover) — SUCCEEDED
 Requested by alice: quarterly rotation
 
-TARGET  HOST        ACCOUNT  STATUS  VERSION  DETAIL
+SYSTEM  HOST        ACCOUNT  STATUS  VERSION  DETAIL
 web1    10.0.0.11   root     OK      4        credential rolled over and verified
 web2    10.0.0.12   root     OK      7        credential rolled over and verified
 ```
+
+The systems SDL knows (hostnames, FQDNs, IP addresses and the service account
+used for each) come from inventory modules: SDL's own store, NetBox, or both.
+Sysadmins pick the systems to roll over on a web page served by SDL, or in
+the CLI, and see the result for each one. See [docs/inventory.md](docs/inventory.md).
 
 ## Design
 
@@ -29,12 +34,14 @@ discovered through Python entry points, so third parties can ship their own.
 | `audit`     | Persist every system and user action          | `audit.jsonl`: hash-chained, tamper-evident file  |
 | `auth`      | Identify API callers                          | `auth.static_token`: hashed bearer tokens         |
 | `generator` | Produce new credentials                       | `generator.password`: CSPRNG password policy      |
+| `inventory` | Know the systems to roll over                 | `inventory.store`: SDL's own, editable via the API; `inventory.netbox`: read from NetBox |
 | `secrets`   | Store credentials in a secret manager         | `secrets.vault`: HashiCorp Vault KV v2            |
 | `target`    | Change and verify a credential on a system    | `target.ssh_linux`: Linux accounts over SSH       |
 
-All clients talk to the core through its HTTP API: the bundled `sdl` CLI
-today, and a web GUI and an MCP server (so LLMs can drive SDL) later. User
-management (OIDC, Entra ID, ...) arrives as further `auth` modules.
+All clients talk to the core through its HTTP API: the bundled `sdl` CLI and
+a minimal web page (at `/ui/`) today, and a full web GUI and an MCP server (so
+LLMs can drive SDL) later. User management (OIDC, Entra ID, ...) arrives as
+further `auth` modules.
 
 See [docs/architecture.md](docs/architecture.md) for the module contract and
 [docs/rollover.md](docs/rollover.md) for exactly what happens during a rollover
@@ -56,12 +63,18 @@ In another shell:
 
 ```bash
 export SDL_TOKEN=<the token printed by `sdl token new`>
-sdl targets
+sdl systems add web3 --inventory inventory --fqdn web3.example.com --ip 10.0.0.13 \
+    --secret-path linux/web3/root            # needs an admin token
+sdl systems list
+sdl rollover run -i --reason "test" --dry-run      # pick systems from a numbered list
 sdl rollover run --all --reason "test" --dry-run   # pre-flight only, changes nothing
 sdl rollover run --all --reason "root password rotation"
 sdl audit --run <run id>
 sdl audit --verify
 ```
+
+Or open http://127.0.0.1:8800/ in a browser, sign in with the token, tick
+the systems and roll them over.
 
 ### Preparing a Linux VM
 

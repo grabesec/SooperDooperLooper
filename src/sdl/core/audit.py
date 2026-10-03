@@ -25,7 +25,7 @@ log = logging.getLogger("sdl.audit")
 REDACTED = "[redacted]"
 _SENSITIVE_KEY = re.compile(r"pass(word|phrase)?|secret|token|credential|private_?key", re.I)
 # Keys that name or describe a secret without containing it, e.g. ``secret_path``.
-_SAFE_SUFFIXES = ("_path", "_env", "_version", "_id", "_length")
+_SAFE_SUFFIXES = ("_path", "_env", "_version", "_id", "_length", "_type")
 
 
 class AuditUnavailableError(RuntimeError):

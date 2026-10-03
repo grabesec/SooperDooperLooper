@@ -37,6 +37,14 @@ class RolloverSettings(BaseModel):
     )
 
 
+class InventorySettings(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    timeout: float = Field(
+        default=30, gt=0, description="Seconds to wait for an inventory module to list its systems."
+    )
+
+
 class ApiSettings(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -49,7 +57,11 @@ class Settings(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     modules: dict[str, ModuleInstanceSettings]
-    targets: list[TargetSpec] = Field(default_factory=list)
+    targets: list[TargetSpec] = Field(
+        default_factory=list,
+        description="Systems listed directly in the configuration; inventory modules add more.",
+    )
+    inventory: InventorySettings = Field(default_factory=InventorySettings)
     rollover: RolloverSettings = Field(default_factory=RolloverSettings)
     api: ApiSettings = Field(default_factory=ApiSettings)
 

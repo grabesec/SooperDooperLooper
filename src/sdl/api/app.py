@@ -3,24 +3,53 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import AsyncIterator, Awaitable, Callable
-from contextlib import asynccontextmanager
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
+from contextlib import asynccontextmanager, contextmanager
+from importlib.resources import files
 from typing import Annotated, Any
 
-from fastapi import Depends, FastAPI, HTTPException, Query, Request, status
+from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response, status
+from fastapi.responses import RedirectResponse
 from pydantic import BaseModel
 
 from sdl import __version__
-from sdl.core.models import Actor, AuditEvent, Outcome, RolloverRequest, RolloverRun, TargetSpec
-from sdl.core.orchestrator import Orchestrator, RequestError
+from sdl.core.models import (
+    Actor,
+    AuditEvent,
+    Inventory,
+    InventorySource,
+    Outcome,
+    RolloverRequest,
+    RolloverRun,
+    TargetSpec,
+)
+from sdl.core.module import ModuleError
+from sdl.core.orchestrator import ConflictError, NotFoundError, Orchestrator, RequestError
 from sdl.core.permissions import (
     AUDIT_READ,
+    INVENTORY_WRITE,
     MODULES_READ,
+    ROLE_PERMISSIONS,
     ROLLOVER_READ,
     ROLLOVER_RUN,
     TARGETS_READ,
     allowed,
 )
+
+UI_FILES = {
+    "index.html": "text/html; charset=utf-8",
+    "app.js": "text/javascript; charset=utf-8",
+    "app.css": "text/css; charset=utf-8",
+}
+UI_HEADERS = {
+    "Content-Security-Policy": (
+        "default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; "
+        "img-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'"
+    ),
+    "X-Content-Type-Options": "nosniff",
+    "Referrer-Policy": "no-referrer",
+    "Cache-Control": "no-cache",
+}
 
 
 class ModuleInfo(BaseModel):
@@ -34,6 +63,47 @@ class ModuleInfo(BaseModel):
 class AuditVerification(BaseModel):
     ok: bool
     detail: str
+
+
+class Me(BaseModel):
+    actor: Actor
+    permissions: list[str]
+
+
+@contextmanager
+def http_errors() -> Iterator[None]:
+    """Turn the core's request errors into HTTP responses."""
+    try:
+        yield
+    except NotFoundError as exc:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, str(exc)) from exc
+    except ConflictError as exc:
+        raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
+    except RequestError as exc:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc)) from exc
+    except ModuleError as exc:
+        raise HTTPException(status.HTTP_502_BAD_GATEWAY, str(exc)) from exc
+
+
+def _matches(system: TargetSpec, q: str | None, group: str | None, source: str | None) -> bool:
+    if group is not None and group not in system.groups:
+        return False
+    if source is not None and system.source != source:
+        return False
+    if q:
+        haystack = " ".join(
+            [
+                system.name,
+                system.hostname or "",
+                system.fqdn or "",
+                system.host,
+                *system.addresses,
+                *system.groups,
+                system.description or "",
+            ]
+        ).lower()
+        return all(word in haystack for word in q.lower().split())
+    return True
 
 
 def require(permission: str) -> Callable[[Request], Awaitable[Actor]]:
@@ -99,6 +169,32 @@ def create_app(orchestrator: Orchestrator) -> FastAPI:
     async def health() -> dict[str, str]:
         return {"status": "ok", "version": __version__}
 
+    @app.get("/", include_in_schema=False)
+    async def root() -> RedirectResponse:
+        return RedirectResponse("/ui/")
+
+    @app.get("/favicon.ico", include_in_schema=False)
+    async def favicon() -> Response:
+        return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+    @app.get("/ui", include_in_schema=False)
+    async def ui_redirect() -> RedirectResponse:
+        return RedirectResponse("/ui/")
+
+    @app.get("/ui/{name:path}", include_in_schema=False)
+    async def ui(name: str) -> Response:
+        """The rollover web page: pick systems, run, watch per-system results."""
+        name = name or "index.html"
+        if name not in UI_FILES:
+            raise HTTPException(status.HTTP_404_NOT_FOUND)
+        body = files("sdl.api").joinpath("ui", name).read_bytes()
+        return Response(body, media_type=UI_FILES[name], headers=UI_HEADERS)
+
+    @app.get("/api/v1/me", tags=["system"])
+    async def me(actor: Annotated[Actor, Depends(require(TARGETS_READ))]) -> Me:
+        granted = set().union(*(ROLE_PERMISSIONS.get(r, frozenset()) for r in actor.roles))
+        return Me(actor=actor, permissions=sorted(granted))
+
     @app.get("/api/v1/modules", tags=["system"])
     async def list_modules(
         _: Annotated[Actor, Depends(require(MODULES_READ))],
@@ -119,11 +215,70 @@ def create_app(orchestrator: Orchestrator) -> FastAPI:
 
         return list(await asyncio.gather(*(info(i) for i in orchestrator.modules)))
 
-    @app.get("/api/v1/targets", tags=["targets"])
+    @app.get("/api/v1/systems", tags=["inventory"])
+    async def list_systems(
+        _: Annotated[Actor, Depends(require(TARGETS_READ))],
+        q: Annotated[str | None, Query(description="Words to match in any field.")] = None,
+        group: str | None = None,
+        source: Annotated[str | None, Query(description="Only this inventory.")] = None,
+    ) -> Inventory:
+        """Every system from every inventory, with each inventory's status."""
+        inventory = await orchestrator.inventory()
+        inventory.systems = [s for s in inventory.systems if _matches(s, q, group, source)]
+        return inventory
+
+    @app.get("/api/v1/systems/{name}", tags=["inventory"])
+    async def get_system(
+        name: str, _: Annotated[Actor, Depends(require(TARGETS_READ))]
+    ) -> TargetSpec:
+        with http_errors():
+            return await orchestrator.get_system(name)
+
+    @app.get("/api/v1/targets", tags=["inventory"])
     async def list_targets(
         _: Annotated[Actor, Depends(require(TARGETS_READ))],
     ) -> list[TargetSpec]:
-        return orchestrator.targets
+        """Every system, without inventory status (kept for older clients)."""
+        return (await orchestrator.inventory()).systems
+
+    @app.get("/api/v1/inventory", tags=["inventory"])
+    async def list_inventories(
+        _: Annotated[Actor, Depends(require(TARGETS_READ))],
+    ) -> list[InventorySource]:
+        return (await orchestrator.inventory()).sources
+
+    @app.post("/api/v1/inventory/refresh", tags=["inventory"])
+    async def refresh_inventory(
+        actor: Annotated[Actor, Depends(require(TARGETS_READ))],
+    ) -> list[InventorySource]:
+        """Drop cached inventory data (NetBox, ...) and read every source again."""
+        return (await orchestrator.refresh_inventory(actor)).sources
+
+    @app.put("/api/v1/inventory/{inventory_id}/systems/{name}", tags=["inventory"])
+    async def put_system(
+        inventory_id: str,
+        name: str,
+        body: TargetSpec,
+        actor: Annotated[Actor, Depends(require(INVENTORY_WRITE))],
+    ) -> TargetSpec:
+        """Add a system to a writable inventory, or replace it."""
+        if body.name != name:
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, "name in the body and URL differ")
+        with http_errors():
+            return await orchestrator.put_system(inventory_id, body, actor)
+
+    @app.delete(
+        "/api/v1/inventory/{inventory_id}/systems/{name}",
+        tags=["inventory"],
+        status_code=status.HTTP_204_NO_CONTENT,
+    )
+    async def delete_system(
+        inventory_id: str,
+        name: str,
+        actor: Annotated[Actor, Depends(require(INVENTORY_WRITE))],
+    ) -> None:
+        with http_errors():
+            await orchestrator.delete_system(inventory_id, name, actor)
 
     @app.post("/api/v1/rollovers", tags=["rollovers"], status_code=status.HTTP_202_ACCEPTED)
     async def start_rollover(
@@ -132,15 +287,8 @@ def create_app(orchestrator: Orchestrator) -> FastAPI:
         wait: Annotated[bool, Query(description="Return only when the run has finished.")] = False,
         timeout: Annotated[float, Query(gt=0, le=3600)] = 600,
     ) -> RolloverRun:
-        try:
+        with http_errors():
             run = await orchestrator.start_rollover(body, actor)
-        except RequestError as exc:
-            code = (
-                status.HTTP_409_CONFLICT
-                if "in progress" in str(exc)
-                else status.HTTP_400_BAD_REQUEST
-            )
-            raise HTTPException(code, str(exc)) from exc
         if wait:
             try:
                 run = await orchestrator.wait(run.id, timeout)

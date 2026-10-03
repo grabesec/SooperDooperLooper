@@ -11,11 +11,14 @@ from sdl.core.models import Actor
 ROLLOVER_RUN = "rollover:run"
 ROLLOVER_READ = "rollover:read"
 TARGETS_READ = "targets:read"
+INVENTORY_WRITE = "inventory:write"
 AUDIT_READ = "audit:read"
 MODULES_READ = "modules:read"
 
 ROLE_PERMISSIONS: dict[str, frozenset[str]] = {
-    "admin": frozenset({ROLLOVER_RUN, ROLLOVER_READ, TARGETS_READ, AUDIT_READ, MODULES_READ}),
+    "admin": frozenset(
+        {ROLLOVER_RUN, ROLLOVER_READ, TARGETS_READ, INVENTORY_WRITE, AUDIT_READ, MODULES_READ}
+    ),
     "operator": frozenset({ROLLOVER_RUN, ROLLOVER_READ, TARGETS_READ}),
     "auditor": frozenset({ROLLOVER_READ, TARGETS_READ, AUDIT_READ}),
 }
