@@ -21,8 +21,10 @@ Usage: ./lab/lab.sh <command>
   sdl [--as ROLE] ...  run the sdl CLI in the lab (ROLE: admin [default], operator, auditor)
   password SYSTEM      print the root password Vault holds for web1, web2, db1 or app1
   root-login SYSTEM    check root can sign in to that system with Vault's password
-  logs [SERVICE]       follow the logs of sdl (default), vault, sink, vm1 ... vm4
-  stop SERVICE         stop one part (vault, sink, vm2, ...) to test failures
+  totp USER|KEY        print the current authenticator code of olga or ivan, or for
+                       a key the web page shows when setting up an authenticator
+  logs [SERVICE]       follow the logs of sdl (default), vault, sink, ldap, vm1 ... vm4
+  stop SERVICE         stop one part (vault, sink, ldap, vm2, ...) to test failures
   start SERVICE        start it again
   smoke                run a quick automated check of the lab
 EOF
@@ -38,14 +40,19 @@ summary() {
 
 SDL lab is ready.
 
-  Web page   http://127.0.0.1:${sdl_port}/ui/   sign in with one of the tokens below
+  Web page   http://127.0.0.1:${sdl_port}/ui/   sign in as a user or with a token below
   API docs   http://127.0.0.1:${sdl_port}/docs
   Vault UI   http://127.0.0.1:${vault_port}/ui/  token: sdl-lab-root
   Log sink   http://127.0.0.1:${sink_port}/       what SDL forwarded to syslog, Graylog, Splunk
 
-  Tokens     admin-token     admin    (everything)
-             operator-token  operator (roll over, see systems and runs)
-             auditor-token   auditor  (see systems, runs and the audit log)
+  Superuser  sdladmin / lab-superuser-password
+  Users      olga   / web-operator-pass   operator of web1, web2   code: ./lab/lab.sh totp olga
+             ivan   / auditor-lab-pass    auditor, every system    code: ./lab/lab.sh totp ivan
+             newbie / temporary-password  operator of app1; first sign-in sets a new
+                                          password and an authenticator
+  Directory  alice (admin), bob (web operator), carol (auditor), dave (no access)
+             password ldap-password; pick "Lab directory (LDAP)" when signing in
+  Tokens     admin-token, operator-token, auditor-token   (API tokens, as before)
 
   Systems    web1 (vm1)  web2 (vm2)  db1 (vm3, no sudo rule: fails on purpose)  app1 (vm4)
   VMs        ssh -p 2221..2224 root@127.0.0.1   (root password: ./lab/lab.sh password web1)
@@ -108,6 +115,9 @@ case "$cmd" in
       *) echo "unknown role $role (admin, operator, auditor)" >&2; exit 2 ;;
     esac
     exec "${compose[@]}" exec $(exec_flags) -e SDL_TOKEN="$role-token" sdl sdl "$@"
+    ;;
+  totp)
+    exec "${compose[@]}" exec -T sdl python /opt/lab/labctl.py totp "${*:?which user? olga or ivan, or a key}"
     ;;
   password | root-login)
     exec "${compose[@]}" exec -T sdl python /opt/lab/labctl.py "$cmd" "${1:?which system? web1, web2, db1 or app1}"

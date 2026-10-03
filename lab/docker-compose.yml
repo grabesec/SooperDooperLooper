@@ -1,4 +1,5 @@
-# SDL manual QA lab: SDL itself, a Vault, four Linux "VMs" and a log sink.
+# SDL manual QA lab: SDL itself, a Vault, four Linux "VMs", an LDAP directory
+# and a log sink.
 # Start it with ./lab/lab.sh up; docs/manual-qa.md walks through what to test.
 #
 #   web1 -> vm1   SDL inventory, service account key read from Vault
@@ -31,11 +32,13 @@ services:
       VAULT_ADDR: http://vault:8200
       VAULT_TOKEN: sdl-lab-root
       SPLUNK_HEC_TOKEN: lab-hec-token
+      SDL_LDAP_PASSWORD: search-password
     volumes: ["state:/lab/state", "keys:/lab/keys"]
     ports: ["127.0.0.1:${LAB_SDL_PORT:-8800}:8800"]
     depends_on:
       vault: {condition: service_healthy}
       sink: {condition: service_started}
+      ldap: {condition: service_started}
       vm1: {condition: service_started}
       vm2: {condition: service_started}
       vm3: {condition: service_started}
@@ -69,6 +72,13 @@ services:
       SPLUNK_HEC_TOKEN: lab-hec-token
     volumes: ["./sink:/lab:ro"]
     ports: ["127.0.0.1:${LAB_SINK_PORT:-8900}:8900"]
+    restart: unless-stopped
+
+  # People and groups SDL signs users in with; see lab/ldap/directory.ldif.
+  ldap:
+    build:
+      context: ./ldap
+    image: sdl-lab-ldap
     restart: unless-stopped
 
   vm1:

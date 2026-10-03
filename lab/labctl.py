@@ -1,11 +1,13 @@
 """The SDL lab's helper, run inside the lab's SDL container.
 
-  serve              prepare the lab (SSH key, known_hosts, Vault, sdl.yaml),
-                     run `sdl serve`, and add the lab systems to SDL's inventory
-  ready              exit 0 once SDL answers and the lab systems are in place
+  serve              prepare the lab (SSH key, known_hosts, Vault, superuser,
+                     sdl.yaml), run `sdl serve`, and add the lab systems and users
+  ready              exit 0 once SDL answers and the lab systems and users are in place
   password SYSTEM    print the root password Vault holds for a lab system
   root-login SYSTEM  try root logins on the system's VM with Vault's password
                      and with the lab's initial one
+  totp USER|KEY      print the current authenticator code of a lab user, or for
+                     an authenticator key shown on the web page
   smoke              a quick automated pass over the lab (used by CI)
 
 Normally reached through ./lab/lab.sh on the host.
@@ -29,13 +31,17 @@ import asyncssh
 import httpx
 import yaml
 
+from sdl.core import superuser, totp
+from sdl.core.passwords import hash_password
 from sdl.modules.auth_static_token import hash_token
 
 STATE = Path("/lab/state")
 KEYS = Path("/lab/keys")
 KEY = KEYS / "id_ed25519"
 CONFIG = STATE / "sdl.yaml"
-SEEDED = STATE / "inventory-seeded"
+SEEDED = STATE / "lab-seeded"
+SUPERUSER_FILE = STATE / "superuser.json"
+TOTP_DIR = STATE / "totp"
 VAULT = os.environ.get("VAULT_ADDR", "http://vault:8200")
 VAULT_TOKEN = os.environ.get("VAULT_TOKEN", "sdl-lab-root")
 SDL = "http://127.0.0.1:8800"
@@ -43,6 +49,21 @@ INITIAL_PASSWORD = "lab-initial-password"
 SERVICE_ACCOUNT_PATH = "svc/sdl-svc"
 
 TOKENS = {"admin": "admin-token", "operator": "operator-token", "auditor": "auditor-token"}
+
+SUPERUSER = ("sdladmin", "lab-superuser-password")
+
+# Local users: name -> (password, roles, access, ready). A ready user has a
+# permanent password and an authenticator already set up (its key is kept in
+# TOTP_DIR for `lab.sh totp`); the others sign in with a temporary password
+# and must choose a new one and set up an authenticator first.
+LOCAL_USERS: dict[str, tuple[str, list[str], dict[str, Any], bool]] = {
+    "olga": ("web-operator-pass", ["operator"], {"groups": ["web"]}, True),
+    "ivan": ("auditor-lab-pass", ["auditor"], {"all_systems": True}, True),
+    "newbie": ("temporary-password", ["operator"], {"systems": ["app1"]}, False),
+}
+
+LDAP_BASE = "dc=lab,dc=example,dc=com"
+LDAP_PASSWORD = "ldap-password"
 
 # name: (VM, where SDL learns about it, groups, description)
 SYSTEMS: dict[str, tuple[str, str, list[str], str]] = {
@@ -149,6 +170,26 @@ def config() -> dict[str, Any]:
                 "type": "inventory.store",
                 "config": {"path": str(STATE / "inventory.json")},
             },
+            "users": {"type": "users.store", "config": {"path": str(STATE / "users.json")}},
+            # The lab's OpenLDAP directory (lab/ldap). Plain ldap:// is allowed
+            # here only because it is a lab; a real directory needs ldaps://.
+            "directory": {
+                "type": "idp.ldap",
+                "config": {
+                    "display_name": "Lab directory (LDAP)",
+                    "urls": ["ldap://ldap"],
+                    "allow_insecure": True,
+                    "bind_dn": f"cn=sdl-search,ou=services,{LDAP_BASE}",
+                    "bind_password_env": "SDL_LDAP_PASSWORD",
+                    "user_base_dn": f"ou=people,{LDAP_BASE}",
+                    "group_base_dn": f"ou=groups,{LDAP_BASE}",
+                    "group_mapping": [
+                        {"group": "SDL-Admins", "roles": ["admin"], "all_systems": True},
+                        {"group": "Web-Operators", "roles": ["operator"], "groups": ["web"]},
+                        {"group": "SDL-Auditors", "roles": ["auditor"], "all_systems": True},
+                    ],
+                },
+            },
             "passwords": {"type": "generator.password", "config": {"length": 24}},
             "vault": {"type": "secrets.vault", "config": {"url": VAULT}},
             "linux": {
@@ -182,6 +223,11 @@ def config() -> dict[str, Any]:
             for name, (vm, source, groups, description) in SYSTEMS.items()
             if source == "sdl.yaml"
         ],
+        "identity": {
+            "superuser_file": str(SUPERUSER_FILE),
+            "require_mfa": True,
+            "lockout": 120,
+        },
         "rollover": {"max_parallel": 5},
     }
 
@@ -209,6 +255,15 @@ def prepare() -> None:
     for name in SYSTEMS:
         if vault_read(secret_path(name)) is None:
             vault_write(secret_path(name), {"password": INITIAL_PASSWORD})
+
+    if not SUPERUSER_FILE.exists():
+        name, password = SUPERUSER
+        superuser.save(
+            SUPERUSER_FILE,
+            superuser.Superuser(
+                name=name, display_name="Lab superuser", password_hash=hash_password(password)
+            ),
+        )
 
     CONFIG.write_text(yaml.safe_dump(config(), sort_keys=False))
 
@@ -241,7 +296,73 @@ def seed_inventory() -> None:
         )  # fmt: skip
         if added.returncode != 0:
             raise RuntimeError(f"adding {name}: {added.stdout}{added.stderr}")
-    SEEDED.touch()
+
+
+def api(method: str, path: str, token: str, **kwargs: Any) -> httpx.Response:
+    return httpx.request(
+        method, f"{SDL}{path}", headers={"Authorization": f"Bearer {token}"}, timeout=30, **kwargs
+    )
+
+
+def login(name: str, password: str, provider: str | None = None) -> httpx.Response:
+    body: dict[str, Any] = {"username": name, "password": password}
+    secret_file = TOTP_DIR / name
+    if secret_file.exists():
+        # A code is accepted once only: wait for a fresh one if this one was used.
+        step = totp.current_step()
+        last = TOTP_DIR / f"{name}.last"
+        if last.exists() and int(last.read_text()) >= step:
+            time.sleep(30 - time.time() % 30 + 1)
+            step = totp.current_step()
+        body["code"] = totp.code_at(secret_file.read_text().strip(), step)
+        last.write_text(str(step))
+    if provider:
+        body["provider"] = provider
+    return httpx.post(f"{SDL}/api/v1/auth/login", json=body, timeout=30)
+
+
+def seed_users() -> None:
+    admin = TOKENS["admin"]
+    present = {u["name"] for u in api("GET", "/api/v1/users", admin).raise_for_status().json()}
+    TOTP_DIR.mkdir(mode=0o700, exist_ok=True)
+    for name, (password, roles, access, ready) in LOCAL_USERS.items():
+        if name in present:
+            if not ready or (TOTP_DIR / name).exists():
+                continue
+            api("DELETE", f"/api/v1/users/{name}", admin).raise_for_status()  # half set up
+        api(
+            "POST",
+            "/api/v1/users",
+            admin,
+            json={
+                "name": name,
+                "display_name": name.capitalize(),
+                "email": f"{name}@lab.example.com",
+                "password": password if not ready else f"temporary-{password}",
+                "roles": roles,
+                "access": access,
+            },
+        ).raise_for_status()
+        if not ready:
+            continue
+        api(
+            "POST",
+            f"/api/v1/users/{name}/password",
+            admin,
+            json={"password": password, "temporary": False},
+        ).raise_for_status()
+        session = login(name, password).raise_for_status().json()["token"]
+        secret = api("POST", "/api/v1/me/mfa/totp", session).raise_for_status().json()["secret"]
+        step = totp.current_step()
+        api(
+            "POST",
+            "/api/v1/me/mfa/totp/confirm",
+            session,
+            json={"code": totp.code_at(secret, step)},
+        ).raise_for_status()
+        (TOTP_DIR / name).write_text(secret)
+        (TOTP_DIR / f"{name}.last").write_text(str(step))
+        api("POST", "/api/v1/auth/logout", session)
 
 
 def serve() -> int:
@@ -255,6 +376,8 @@ def serve() -> int:
     try:
         wait_for(lambda: httpx.get(f"{SDL}/health").status_code == 200, "sdl", timeout=60)
         seed_inventory()
+        seed_users()
+        SEEDED.touch()
         print("lab: ready on http://127.0.0.1:8800/ui/", flush=True)
     except Exception as exc:
         print(f"lab: setup failed: {exc}", file=sys.stderr, flush=True)
@@ -304,6 +427,31 @@ def root_login(system: str) -> int:
     return 0 if with_vault and not with_initial else 1
 
 
+def totp_code(name: str) -> int:
+    """The current code for a ready lab user, or for an authenticator key pasted from the page."""
+    secret_file = TOTP_DIR / name
+    key = name.replace(" ", "").upper()
+    if not secret_file.exists() and len(key) >= 16 and key.isalnum():
+        print(
+            f"{totp.code_at(key, totp.current_step())}    "
+            f"(valid {int(30 - time.time() % 30)} more seconds)"
+        )
+        return 0
+    if not secret_file.exists():
+        raise SystemExit(
+            f"{name} has no lab authenticator; ready users: "
+            + ", ".join(n for n, u in LOCAL_USERS.items() if u[3])
+        )
+    secret = secret_file.read_text().strip()
+    left = int(30 - time.time() % 30)
+    print(
+        f"{totp.code_at(secret, totp.current_step())}    (valid {left} more seconds; "
+        f"each code works once)"
+    )
+    print(f"authenticator key: {secret}")
+    return 0
+
+
 def smoke() -> int:
     failures: list[str] = []
 
@@ -343,6 +491,32 @@ def smoke() -> int:
         denied.stdout + denied.stderr,
     )
 
+    name, password = SUPERUSER
+    signed_in = httpx.post(
+        f"{SDL}/api/v1/auth/login", json={"username": name, "password": password}
+    )
+    check("the superuser signs in", signed_in.status_code == 200, signed_in.text)
+
+    no_code = httpx.post(
+        f"{SDL}/api/v1/auth/login",
+        json={"username": "olga", "password": LOCAL_USERS["olga"][0]},
+    )
+    check("olga needs her authenticator code", no_code.status_code == 401, no_code.text)
+    signed_in = login("olga", LOCAL_USERS["olga"][0])
+    check("olga signs in with password and code", signed_in.status_code == 200, signed_in.text)
+    if signed_in.status_code == 200:
+        token = signed_in.json()["token"]
+        seen = sorted(s["name"] for s in api("GET", "/api/v1/systems", token).json()["systems"])
+        check("olga sees only the web systems", seen == ["web1", "web2"], str(seen))
+
+    signed_in = login("bob", LDAP_PASSWORD, provider="directory")
+    check("bob signs in from the LDAP directory", signed_in.status_code == 200, signed_in.text)
+    if signed_in.status_code == 200:
+        me = api("GET", "/api/v1/me", signed_in.json()["token"]).json()
+        check("bob is an operator of web", me["actor"]["roles"] == ["operator"], str(me))
+    refused = login("dave", LDAP_PASSWORD, provider="directory")
+    check("dave (no SDL group) is refused", refused.status_code in (401, 403), refused.text)
+
     verify = cli("audit", "--verify")
     check("the audit log's hash chain verifies", verify.returncode == 0, verify.stdout)
 
@@ -372,6 +546,8 @@ def main() -> int:
         return password(args[1])
     if len(args) == 2 and args[0] == "root-login":
         return root_login(args[1])
+    if len(args) == 2 and args[0] == "totp":
+        return totp_code(args[1])
     print(__doc__, file=sys.stderr)
     return 2
 

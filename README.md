@@ -68,8 +68,8 @@ and how SDL makes sure a password is never lost.
 ./lab/lab.sh up
 ```
 
-starts a lab in Docker (SDL, Vault, four Linux VMs and a log sink, already
-filled in) and prints where to sign in. [docs/manual-qa.md](docs/manual-qa.md)
+starts a lab in Docker (SDL, Vault, four Linux VMs, an LDAP directory and a
+log sink, already filled in with systems and users) and prints where to sign in. [docs/manual-qa.md](docs/manual-qa.md)
 walks through testing every feature by hand.
 
 ## Quick start
