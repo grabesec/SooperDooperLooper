@@ -12,9 +12,10 @@ speaks SSH, talks to a secret manager or writes a log file itself; modules do.
 └──┬──────────┬───────────────┬────────────────┬────────────────┬────────────┬───┘
    │ audit    │ auth          │ generator      │ inventory      │ secrets    │ target
  audit.jsonl  auth.static_    generator.       inventory.store  secrets.     target.ssh_linux
-              token           password         inventory.netbox vault        (Windows, DBs, ...)
-              (OIDC, Entra                     (CMDBs, ...)     (Bitwarden,
-               ID, ...)                                          ...)
+   │          token           password         inventory.netbox vault        (Windows, DBs, ...)
+   │          (OIDC, Entra                     (CMDBs, ...)     (Bitwarden,
+   │           ID, ...)                                          ...)
+   └─ forwarder: forwarder.syslog · forwarder.gelf (Graylog) · forwarder.splunk_hec
 ```
 
 ## Modules
@@ -31,8 +32,9 @@ third-party package would register its own:
 
 | Contract          | Must implement                                   |
 |-------------------|--------------------------------------------------|
-| `AuditModule`     | `write(event)`, `query(...)`, optionally `verify()` |
+| `AuditModule`     | `write(event)`, `query(AuditQuery)`, optionally `facets()`, `verify()` |
 | `AuthModule`      | `authenticate(request) -> Actor or None`         |
+| `ForwarderModule` | `send(events)`; the core queues, batches and retries |
 | `GeneratorModule` | `generate(target) -> SecretStr`                  |
 | `InventoryModule` | `list_systems()`; writable ones also `put_system()`, `delete_system()` |
 | `SecretsModule`   | `read(path)`, `write(path, record)`, `delete(path)` |
@@ -55,19 +57,27 @@ twice with different settings (the integration tests run two
 
 Every action goes through the core's `AuditRecorder`:
 
-- API calls: each authenticated request (`api.request`) and every rejected one
-  (`api.authenticate`, `api.authorize`), with the caller's identity;
-- the system: start and stop;
-- inventory: every system added, changed or removed, and every refresh;
-- rollovers: the request, then every step for every target, then the outcome.
+- API calls: each authenticated request (`api.request`, with its query
+  string), every rejected one (`api.authenticate`, `api.authorize`), and every
+  request that was let in but then failed (`api.request` with outcome
+  `failure` and the HTTP status);
+- the system: start and stop, and any module that fails to start or stop
+  (`module.start`, `module.stop`);
+- inventory: every system added, changed or removed (including attempts that
+  failed), every refresh, an inventory becoming unavailable and available
+  again, and NetBox objects that could not be turned into systems;
+- rollovers: the request, then every step for every target, then the outcome;
+- forwarding: a forwarder losing and regaining its destination.
 
 The recorder redacts anything secret-looking before an event reaches an audit
 module, and **fails closed**: if no audit module accepts an event, the
 workflow stops rather than act without a record. Several audit modules can be
-configured (for example a local file and a SIEM); each receives every event.
+configured; each receives every event, and the first answers queries.
 
 `audit.jsonl` hash-chains its entries, so `sdl audit --verify` detects an
-edited, deleted or reordered line.
+edited, deleted or reordered line. Reviewing the log (filters by system, date,
+action type, user) and forwarding it to syslog, Graylog or Splunk are
+described in [logs.md](logs.md).
 
 ## Access control
 

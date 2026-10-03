@@ -1,9 +1,10 @@
 """The audit recorder: the single path every audit event takes.
 
-It redacts secrets, fans each event out to every configured audit module and
-mirrors it to the Python log. If no audit module accepts an event the
-recorder raises, so a workflow never carries on with an action it could not
-record.
+It redacts secrets, fans each event out to every configured audit module,
+mirrors it to the Python log and queues it for every forwarder module. If no
+audit module accepts an event the recorder raises, so a workflow never carries
+on with an action it could not record. Forwarding happens afterwards, in the
+background, and can never make recording fail.
 """
 
 from __future__ import annotations
@@ -15,6 +16,7 @@ from typing import TYPE_CHECKING, Any
 
 from pydantic import SecretBytes, SecretStr
 
+from sdl.core.forwarding import Forwarding
 from sdl.core.models import Actor, AuditEvent, Outcome
 
 if TYPE_CHECKING:
@@ -48,6 +50,7 @@ def redact(value: Any, key: str | None = None) -> Any:
 class AuditRecorder:
     def __init__(self, modules: Sequence[AuditModule] = ()) -> None:
         self._modules: list[AuditModule] = list(modules)
+        self.forwarding = Forwarding()
 
     def attach(self, modules: Sequence[AuditModule]) -> None:
         self._modules = list(modules)
@@ -105,4 +108,5 @@ class AuditRecorder:
             event.target or "-",
             event.message or "",
         )
+        self.forwarding.publish(stored)
         return stored

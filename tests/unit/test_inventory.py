@@ -10,6 +10,7 @@ from pydantic import SecretStr, ValidationError
 from sdl.core.models import (
     Actor,
     ActorType,
+    AuditQuery,
     RolloverRequest,
     SecretRecord,
     ServiceAccount,
@@ -220,7 +221,7 @@ async def test_inventory_changes_are_audited(orchestrator: Orchestrator) -> None
     await orchestrator.delete_system("inventory", "web1", ALICE)
     with pytest.raises(NotFoundError):
         await orchestrator.delete_system("inventory", "web1", ALICE)
-    events = await orchestrator.audit.primary.query(target="web1")
+    events = await orchestrator.audit.primary.query(AuditQuery(targets=["web1"]))
     assert [(e.action, e.actor.id) for e in events] == [
         ("inventory.system.add", "alice"),
         ("inventory.system.update", "alice"),

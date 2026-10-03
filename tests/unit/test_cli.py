@@ -3,6 +3,7 @@ from __future__ import annotations
 import contextlib
 import json
 from collections.abc import Iterator
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -101,3 +102,44 @@ def test_interactive_rollover_can_be_cancelled(
     assert cli.main(["rollover", "run", "-i", "--search", "vm", "-r", "x"]) == 1
     assert "Cancelled" in capsys.readouterr().out
     assert api.get("/api/v1/rollovers").json() == []
+
+
+def test_parse_time() -> None:
+    day = cli.parse_time("2026-10-01")
+    assert (day.year, day.month, day.day, day.hour) == (2026, 10, 1, 0) and day.tzinfo
+    assert cli.parse_time("2026-10-01", end=True) - day == timedelta(days=1)
+    assert cli.parse_time("2026-10-01T14:30+02:00").utcoffset() == timedelta(hours=2)
+    assert cli.parse_time("2026-10-01T14:30").tzinfo is not None
+    assert datetime.now(UTC) - cli.parse_time("24h") > timedelta(hours=23, minutes=59)
+    assert cli.parse_time("today", end=True) - cli.parse_time("today") == timedelta(days=1)
+    with pytest.raises(cli.CliError, match="not a time"):
+        cli.parse_time("last tuesday")
+
+
+def test_review_the_log(api: TestClient, capsys: pytest.CaptureFixture[str]) -> None:
+    assert cli.main(["rollover", "run", "-t", "vm1", "-r", "rotate"]) == 0
+    assert cli.main(["rollover", "run", "-t", "vm2", "-r", "check", "--dry-run"]) == 0
+    capsys.readouterr()
+
+    assert cli.main(["logs", "--system", "vm1", "-a", "rollover.target.change", "--json"]) == 0
+    events = json.loads(capsys.readouterr().out)
+    assert events and {(e["target"], e["action"]) for e in events} == {
+        ("vm1", "rollover.target.change")
+    }
+
+    assert cli.main(["audit", "-t", "vm2", "--since", "1h", "--until", "today", "-v"]) == 0
+    out = capsys.readouterr().out
+    assert "rollover.target.preflight" in out and "[vm2] (linux)" in out and '"dry_run"' in out
+    assert "vm1" not in out
+
+    assert cli.main(["logs", "-u", "alice", "-o", "failure", "--newest-first"]) == 0
+    assert "no events match" in capsys.readouterr().err
+
+    assert cli.main(["logs", "--facets"]) == 0
+    out = capsys.readouterr().out
+    assert "Systems:" in out and "vm1" in out and "rollover.target.change" in out
+
+    assert cli.main(["logs", "--since", "someday"]) == 2
+
+    assert cli.main(["forwarders"]) == 0
+    assert "no forwarder modules" in capsys.readouterr().err

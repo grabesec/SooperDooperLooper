@@ -23,6 +23,11 @@ used for each) come from inventory modules: SDL's own store, NetBox, or both.
 Sysadmins pick the systems to roll over on a web page served by SDL, or in
 the CLI, and see the result for each one. See [docs/inventory.md](docs/inventory.md).
 
+Everything SDL and its users do lands in the audit log, which sysadmins review
+by system, date range, action type and user (`sdl logs`, or the Log section of
+the web page) and which SDL can forward to syslog, Graylog or Splunk. See
+[docs/logs.md](docs/logs.md).
+
 ## Design
 
 SDL's backend is an **orchestrator**: a thin core that loads modules and runs
@@ -33,6 +38,7 @@ discovered through Python entry points, so third parties can ship their own.
 |-------------|-----------------------------------------------|--------------------------------------------------|
 | `audit`     | Persist every system and user action          | `audit.jsonl`: hash-chained, tamper-evident file  |
 | `auth`      | Identify API callers                          | `auth.static_token`: hashed bearer tokens         |
+| `forwarder` | Ship the audit log to a log concentrator      | `forwarder.syslog` (RFC 5424, UDP/TCP/TLS), `forwarder.gelf` (Graylog), `forwarder.splunk_hec` (Splunk) |
 | `generator` | Produce new credentials                       | `generator.password`: CSPRNG password policy      |
 | `inventory` | Know the systems to roll over                 | `inventory.store`: SDL's own, editable via the API; `inventory.netbox`: read from NetBox |
 | `secrets`   | Store credentials in a secret manager         | `secrets.vault`: HashiCorp Vault KV v2            |
@@ -69,6 +75,8 @@ sdl systems list
 sdl rollover run -i --reason "test" --dry-run      # pick systems from a numbered list
 sdl rollover run --all --reason "test" --dry-run   # pre-flight only, changes nothing
 sdl rollover run --all --reason "root password rotation"
+sdl logs --system web1 --since 7d                   # everything that happened to web1
+sdl logs --action rollover --user alice --since 2026-10-01 --until 2026-10-31
 sdl audit --run <run id>
 sdl audit --verify
 ```

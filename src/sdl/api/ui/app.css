@@ -61,7 +61,7 @@ main { max-width: 1280px; margin: 0 auto; padding: 16px; display: grid; gap: 16p
 .error { color: var(--bad); min-height: 1em; margin: 8px 0 0; }
 .who { display: flex; gap: 12px; align-items: center; color: var(--muted); }
 input, select, button { font: inherit; color: inherit; }
-input[type=text], input[type=search], input[type=password], input[type=number], input:not([type]), select {
+input[type=text], input[type=search], input[type=password], input[type=number], input[type=datetime-local], input:not([type]), select {
   background: var(--bg); border: 1px solid var(--border); border-radius: 6px; padding: 6px 8px; min-width: 0;
 }
 label { display: grid; gap: 4px; color: var(--muted); }
@@ -102,3 +102,16 @@ dialog::backdrop { background: rgba(0, 0, 0, .4); }
 .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 10px; }
 .grid .wide { grid-column: 1 / -1; }
 .actions { display: flex; justify-content: flex-end; gap: 8px; }
+.log-filters { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 10px; align-items: end; }
+.log-buttons { display: flex; gap: 8px; }
+.o-success { background: var(--ok-bg); color: var(--ok); }
+.o-failure { background: var(--bad-bg); color: var(--bad); }
+.o-denied { background: var(--warn-bg); color: var(--warn); }
+.o-info, .o-started { background: var(--info-bg); color: var(--info); }
+#events td { font-size: 13px; }
+#events td.nowrap { white-space: nowrap; }
+#events pre { margin: 6px 0 0; white-space: pre-wrap; word-break: break-word; font-size: 12px; color: var(--muted); }
+.forwarders { margin-top: 12px; display: flex; flex-wrap: wrap; gap: 8px; }
+.ok-text { color: var(--ok); }
+.bad-text { color: var(--bad); }
+.log-filters input, .log-filters select { width: 100%; min-width: 0; }
