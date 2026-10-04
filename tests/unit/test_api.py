@@ -203,7 +203,9 @@ def test_roll_over_selected_systems_and_see_each_result(inventory_api: TestClien
 
 
 def test_refresh_and_inventory_status(inventory_api: TestClient) -> None:
-    sources = inventory_api.post("/api/v1/inventory/refresh", headers=auth(OPERATOR_TOKEN)).json()
+    sources = inventory_api.post("/api/v1/inventory/refresh", headers=auth(ADMIN_TOKEN)).json()
+    refresh = inventory_api.post("/api/v1/inventory/refresh", headers=auth(OPERATOR_TOKEN))
+    assert refresh.status_code == 403
     assert [s["id"] for s in sources] == ["sdl.yaml", "inventory"]
     assert inventory_api.get("/api/v1/inventory", headers=auth(AUDITOR_TOKEN)).status_code == 200
 

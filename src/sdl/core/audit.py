@@ -47,6 +47,18 @@ def redact(value: Any, key: str | None = None) -> Any:
     return value
 
 
+_SECRET_IN_TEXT = re.compile(
+    r"(?i)\b(password|passwd|secret|token|api[_-]?key|authorization)(\s*[=:]\s*)(?:bearer\s+)?\S+"
+)
+
+
+def redact_text(text: str | None) -> str | None:
+    """Mask ``password=...``-style secrets in free text."""
+    if not text:
+        return text
+    return _SECRET_IN_TEXT.sub(lambda m: f"{m.group(1)}{m.group(2)}{REDACTED}", text)
+
+
 class AuditRecorder:
     def __init__(self, modules: Sequence[AuditModule] = ()) -> None:
         self._modules: list[AuditModule] = list(modules)
@@ -82,7 +94,7 @@ class AuditRecorder:
             run_id=run_id,
             target=target,
             module=module,
-            message=message,
+            message=redact_text(message),
             details=redact(details),
         )
         if not self._modules:

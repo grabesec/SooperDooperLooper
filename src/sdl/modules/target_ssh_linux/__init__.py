@@ -95,6 +95,12 @@ class SshLinuxTargetModule(TargetModule):
         """The service account's username and the asyncssh options to sign in with it."""
         if credential is not None:
             if credential.credential_type == "password":
+                if not self.config.host_key_checking:
+                    raise ModuleError(
+                        "refusing password login for service account "
+                        f"{credential.username!r} with host_key_checking off: an impostor "
+                        "host would receive the password"
+                    )
                 return credential.username, {
                     "password": credential.secret.get_secret_value(),
                     "client_keys": None,
@@ -260,6 +266,11 @@ class SshLinuxSession(TargetSession):
         return status == 0 and _VERIFY_MARKER in output
 
     async def _verify_ssh_login(self, value: SecretStr) -> bool:
+        if not self.config.host_key_checking:
+            raise ModuleError(
+                "refusing ssh_login verification with host_key_checking off: an impostor "
+                "host would receive the new password"
+            )
         try:
             conn = await asyncio.wait_for(
                 asyncssh.connect(

@@ -140,7 +140,11 @@ async function finishSso() {
   if (![...params.keys()].length) return false;
   history.replaceState(null, "", window.location.pathname);
   if (params.get("sso_error")) {
-    signOut(params.get("sso_error"));
+    const ssoErrors = {
+      state_mismatch: "Single sign-on was not started from this browser. Please try again.",
+      unavailable: "The sign-in service is unavailable. Please try again later.",
+    };
+    signOut(ssoErrors[params.get("sso_error")] || "Single sign-on failed.");
     return true;
   }
   if (params.get("cli_code")) {

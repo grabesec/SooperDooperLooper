@@ -13,7 +13,7 @@ from typing import Any, Literal
 import httpx
 from pydantic import Field, SecretStr, model_validator
 
-from sdl.core.models import SecretRecord
+from sdl.core.models import SecretRecord, validate_secret_path
 from sdl.core.module import ModuleConfig, ModuleError, SecretsModule
 
 
@@ -108,6 +108,7 @@ class VaultKV2SecretsModule(SecretsModule):
         return self._client
 
     def _path(self, path: str) -> str:
+        validate_secret_path(path)
         parts = [self.config.path_prefix.strip("/"), path.strip("/")]
         return "/".join(p for p in parts if p)
 

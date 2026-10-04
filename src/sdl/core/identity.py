@@ -20,6 +20,7 @@ are assigned applies at once.
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import hashlib
 import logging
 import re
@@ -170,6 +171,15 @@ def _ts(value: float) -> datetime:
     return datetime.fromtimestamp(value, UTC)
 
 
+USER_LOCKOUT_FACTOR = 4  # per-user backstop, over all clients
+FAILURE_WINDOW = 3600.0  # seconds a failure counter is kept without new failures
+MAX_FAILURE_ENTRIES = 10_000
+
+_attempt_reserved: contextvars.ContextVar[bool] = contextvars.ContextVar(
+    "sdl_attempt_reserved", default=False
+)
+
+
 class Identity:
     def __init__(
         self,
@@ -191,7 +201,9 @@ class Identity:
         self._sessions: dict[str, Session] = {}
         self._sso: dict[str, _Pending] = {}
         self._codes: dict[str, tuple[str, float]] = {}
-        self._failures: dict[str, tuple[int, float]] = {}
+        # failed sign-ins: "<provider>:<name>" (all clients) and "<provider>:<name>|<client>"
+        # -> (count, locked until, last failure)
+        self._failures: dict[str, tuple[int, float, float]] = {}
         self._totp_last: dict[str, int] = {}
         self._totp_enroll: dict[str, tuple[str, float]] = {}
         self._lock = asyncio.Lock()
@@ -209,6 +221,11 @@ class Identity:
                 raise ConfigError(f"identity provider {provider.instance_id!r}: {exc}") from exc
             if provider.login not in ("password", "redirect"):
                 raise ConfigError(f"identity provider {provider.instance_id!r}: unknown login type")
+            if getattr(provider.config, "require_totp", False) and self.users is None:
+                raise ConfigError(
+                    f"identity provider {provider.instance_id!r} has require_totp set, but no "
+                    "users module is configured to keep the authenticators"
+                )
         path = self.settings.superuser_file
         if path is not None:
             try:
@@ -238,21 +255,59 @@ class Identity:
             )
         return found
 
-    def _locked(self, key: str) -> bool:
-        _, until = self._failures.get(key, (0, 0.0))
-        if until and until > time.time():
-            return True
-        if until:
-            self._failures.pop(key, None)
-        return False
+    def _keys(self, key: str, client: str | None) -> list[tuple[str, int]]:
+        """The failure counters a sign-in touches, with the count that locks each: one per
+        (user, client) when the client is known, and a higher one for the user as a backstop,
+        so a remote attacker cannot easily lock a user out from everywhere."""
+        limit = self.settings.max_failed_logins
+        if client:
+            return [(f"{key}|{client}", limit), (key, limit * USER_LOCKOUT_FACTOR)]
+        return [(key, limit)]
 
-    def _failed(self, key: str) -> None:
-        count, _ = self._failures.get(key, (0, 0.0))
-        count += 1
-        until = 0.0
-        if count >= self.settings.max_failed_logins and self.settings.lockout > 0:
-            until = time.time() + self.settings.lockout
-        self._failures[key] = (count, until)
+    def _prune_failures(self, now: float) -> None:
+        window = max(self.settings.lockout, FAILURE_WINDOW)
+        for k, (_, until, last) in list(self._failures.items()):
+            if until <= now and last + window <= now:
+                del self._failures[k]
+        if len(self._failures) > MAX_FAILURE_ENTRIES:
+            oldest = sorted(self._failures, key=lambda k: self._failures[k][2])
+            for k in oldest[: len(self._failures) - MAX_FAILURE_ENTRIES]:
+                del self._failures[k]
+
+    def _locked(self, key: str, client: str | None = None) -> bool:
+        now = time.time()
+        locked = False
+        for k, _ in self._keys(key, client):
+            _count, until, _last = self._failures.get(k, (0, 0.0, 0.0))
+            if until and until > now:
+                locked = True
+            elif until:
+                self._failures.pop(k, None)
+        return locked
+
+    def _failed(self, key: str, client: str | None = None) -> None:
+        now = time.time()
+        self._prune_failures(now)
+        for k, limit in self._keys(key, client):
+            count, _, _ = self._failures.get(k, (0, 0.0, 0.0))
+            count += 1
+            until = 0.0
+            if count >= limit and self.settings.lockout > 0:
+                until = now + self.settings.lockout
+            self._failures[k] = (count, until, now)
+
+    def _release(self, key: str, client: str | None) -> None:
+        """Give back an attempt reserved before checking it, when it did not fail."""
+        for k, _ in self._keys(key, client):
+            count, until, last = self._failures.get(k, (0, 0.0, 0.0))
+            if count <= 1 and not until:
+                self._failures.pop(k, None)
+            elif count:
+                self._failures[k] = (count - 1, until, last)
+
+    def _clear_failures(self, key: str) -> None:
+        for k in [k for k in self._failures if k == key or k.startswith(f"{key}|")]:
+            del self._failures[k]
 
     async def _refuse(
         self,
@@ -265,8 +320,10 @@ class Identity:
         count: bool = True,
         public: str = "wrong user name, password or code",
     ) -> AuthenticationError:
-        if count:
-            self._failed(f"{provider}:{username}")
+        if count and not _attempt_reserved.get():
+            self._failed(f"{provider}:{username}", client)
+        error = AuthenticationError(public)
+        error.counted = count  # type: ignore[attr-defined]
         await self.audit.record(
             "auth.login",
             outcome,
@@ -276,7 +333,7 @@ class Identity:
             provider=provider,
             client=client,
         )
-        return AuthenticationError(public)
+        return error
 
     def _check_code(self, key: str, secret: SecretStr, code: str | None) -> bool:
         last = self._totp_last.get(key, -1)
@@ -300,7 +357,7 @@ class Identity:
         key = f"{provider}:{username}"
         if not username or not password:
             raise await self._refuse(username, provider, "empty user name or password", client)
-        if self._locked(key):
+        if self._locked(key, client):
             raise await self._refuse(
                 username,
                 provider,
@@ -310,6 +367,27 @@ class Identity:
                 count=False,
                 public="too many failed sign-ins; try again later",
             )
+        # Count the attempt before the (slow, awaited) checks so parallel requests cannot
+        # get past the lockout; give it back when it did not fail on credentials.
+        self._failed(key, client)
+        reserved = _attempt_reserved.set(True)
+        try:
+            result = await self._login_checked(username, password, code, provider, client)
+        except AuthenticationError as exc:
+            if not getattr(exc, "counted", False):
+                self._release(key, client)
+            raise
+        except BaseException:
+            self._release(key, client)
+            raise
+        finally:
+            _attempt_reserved.reset(reserved)
+        self._clear_failures(key)
+        return result
+
+    async def _login_checked(
+        self, username: str, password: str, code: str | None, provider: str, client: str | None
+    ) -> LoginResult:
         if provider == LOCAL_SOURCE:
             result = await self._login_local(username, password, code, client)
         else:
@@ -334,7 +412,6 @@ class Identity:
             if identity is None:
                 raise await self._refuse(username, provider, "wrong user name or password", client)
             result = await self._login_external(idp, identity, client, code=code)
-        self._failures.pop(key, None)
         return result
 
     def _superuser(self) -> superuser.Superuser | None:
@@ -1000,7 +1077,7 @@ class Identity:
         user.password_changed_at = user.updated_at = utcnow()
         user.must_change_password = temporary
         ended = self.revoke(user.name)
-        self._failures.pop(f"{LOCAL_SOURCE}:{user.name}", None)
+        self._clear_failures(f"{LOCAL_SOURCE}:{user.name}")
         details = {"temporary": temporary, "sessions_ended": ended}
         await self._write(actor, "user.password.reset", user, details=details)
 
@@ -1020,7 +1097,7 @@ class Identity:
     async def unlock(self, actor: Actor, name: str) -> None:
         self._can_manage(actor)
         name = name.lower()
-        keys = [k for k in self._failures if k.split(":", 1)[1] == name]
+        keys = [k for k in self._failures if k.split("|", 1)[0].split(":", 1)[1] == name]
         for key in keys:
             del self._failures[key]
         await self.audit.record(
@@ -1072,6 +1149,7 @@ class Identity:
     async def search_directory(
         self, actor: Actor, provider_id: str, query: str, limit: int
     ) -> list[ExternalIdentity]:
+        self._can_manage(actor)
         idp = self.provider(provider_id)
         if not idp.can_search:
             raise RequestError(f"{idp.display_name} cannot list its users")

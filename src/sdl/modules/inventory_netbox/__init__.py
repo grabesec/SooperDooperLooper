@@ -97,6 +97,12 @@ class SystemDefaults(BaseModel):
         return _check_template(value)
 
 
+_MAX_PAGES = 1000
+_OVERRIDE_FIELDS = frozenset(
+    {"sdl_secret_path", "sdl_service_account_path", "sdl_service_account", "sdl_target_module"}
+)
+
+
 class NetBoxConfig(ModuleConfig):
     url: str = Field(description="NetBox base URL, e.g. https://netbox.example.com")
     token_env: str = Field(default="NETBOX_TOKEN", description="Env var holding the API token.")
@@ -119,6 +125,11 @@ class NetBoxConfig(ModuleConfig):
         description="NetBox attributes that become SDL groups (tags as-is, others as 'site:x').",
     )
     custom_fields: bool = Field(default=True, description="Honour the sdl_* custom fields.")
+    allow_custom_field_overrides: bool = Field(
+        default=False,
+        description="Let sdl_secret_path, sdl_service_account(_path) and sdl_target_module "
+        "custom fields override the configured defaults.",
+    )
     defaults: SystemDefaults = Field(default_factory=SystemDefaults)
     cache_ttl: float = Field(default=300, ge=0)
     page_size: int = Field(default=500, ge=1, le=1000)
@@ -239,7 +250,12 @@ class NetBoxInventoryModule(InventoryModule):
         url: str | None = endpoint
         results: list[dict[str, Any]] = []
         headers = self._auth()
+        seen: set[str] = set()
+        pages = 0
         while url is not None:
+            pages += 1
+            if pages > _MAX_PAGES:
+                raise ModuleError(f"netbox GET {endpoint}: more than {_MAX_PAGES} pages")
             try:
                 response = await self._http().get(url, params=params, headers=headers)
             except httpx.HTTPError as exc:
@@ -252,6 +268,10 @@ class NetBoxInventoryModule(InventoryModule):
             # Follow only the path and query of the next page, so the token goes to the
             # configured NetBox even when NetBox (behind a proxy) names another host.
             url = self._relative(next_url) if next_url else None
+            if url is not None:
+                if url in seen:
+                    raise ModuleError(f"netbox GET {endpoint}: pagination loops at {url}")
+                seen.add(url)
             params = None  # the next URL already carries the query
         return results
 
@@ -298,6 +318,9 @@ class NetBoxInventoryModule(InventoryModule):
             host = name
 
         custom = (obj.get("custom_fields") or {}) if self.config.custom_fields else {}
+        if not self.config.allow_custom_field_overrides:
+            # Anyone who can edit NetBox could otherwise point SDL at another secret.
+            custom = {k: v for k, v in custom.items() if k not in _OVERRIDE_FIELDS}
         defaults = self.config.defaults
         account = str(custom.get("sdl_account") or defaults.account)
         values = {

@@ -270,6 +270,8 @@ class OidcIdentityProvider(IdentityProviderModule):
         username = claims.get(self.config.username_claim)
         if not isinstance(username, str) or not username:
             raise ModuleError(f"the ID token has no {self.config.username_claim!r} claim")
+        if self.config.username_claim == "email" and claims.get("email_verified") is not True:
+            raise ModuleError("the provider has not verified this email address")
         groups = claims.get(self.config.groups_claim) or []
         if isinstance(groups, str):
             groups = [groups]

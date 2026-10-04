@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import Any
 
 import httpx
-from pydantic import Field, SecretStr
+from pydantic import Field, SecretStr, model_validator
 
 from sdl.core.forwarding import tls_context
 from sdl.core.models import AuditEvent
@@ -34,6 +34,18 @@ class SplunkHecConfig(ForwarderConfig):
     ca_cert: Path | None = None
     tls_verify: bool = True
     timeout: float = Field(default=15, gt=0)
+    allow_insecure: bool = Field(
+        default=False, description="Allow sending the HEC token over plain http://."
+    )
+
+    @model_validator(mode="after")
+    def _check(self) -> SplunkHecConfig:
+        if self.url.lower().startswith("http://") and not self.allow_insecure:
+            raise ValueError(
+                "url is http:// and would send the HEC token in clear text; "
+                "use https:// or set allow_insecure: true"
+            )
+        return self
 
 
 class SplunkHecForwarderModule(ForwarderModule):

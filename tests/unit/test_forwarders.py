@@ -331,6 +331,7 @@ async def test_gelf_over_http(monkeypatch: pytest.MonkeyPatch) -> None:
         source="sdl-1",
         auth_header="X-Auth",
         auth_value_env="GRAYLOG_KEY",
+        allow_insecure=True,
     )
     module._transport = httpx.MockTransport(handler)
     await module.start()
