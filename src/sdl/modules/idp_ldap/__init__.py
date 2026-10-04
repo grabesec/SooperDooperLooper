@@ -122,9 +122,13 @@ def _first(entry: Any, attribute: str | None) -> str | None:
 
 
 def _cn(dn: str) -> str:
-    first = dn.split(",", 1)[0]
-    key, _, value = first.partition("=")
-    return value.replace("\\", "") if key.strip().lower() == "cn" and value else dn
+    try:
+        from ldap3.utils.dn import parse_dn
+
+        key, value, _ = parse_dn(dn, escape=False, strip=True)[0]
+    except Exception:  # not a parseable DN: match it as a whole
+        return dn
+    return value if key.strip().lower() == "cn" and value else dn
 
 
 class LdapIdentityProvider(IdentityProviderModule):
@@ -186,8 +190,8 @@ class LdapIdentityProvider(IdentityProviderModule):
         )
         try:
             conn.open()
-            if self.config.start_tls:
-                conn.start_tls()
+            if self.config.start_tls and not (conn.start_tls() and conn.tls_started):
+                raise ModuleError("directory unavailable: StartTLS failed")
             conn.bind()
         except LDAPException as exc:
             raise ModuleError(f"directory unavailable: {exc}") from exc
