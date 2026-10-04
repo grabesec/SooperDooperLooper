@@ -62,6 +62,16 @@ See [docs/architecture.md](docs/architecture.md) for the module contract and
 [docs/rollover.md](docs/rollover.md) for exactly what happens during a rollover
 and how SDL makes sure a password is never lost.
 
+## Try it
+
+```bash
+./lab/lab.sh up
+```
+
+starts a lab in Docker (SDL, Vault, four Linux VMs, an LDAP directory and a
+log sink, already filled in with systems and users) and prints where to sign in. [docs/manual-qa.md](docs/manual-qa.md)
+walks through testing every feature by hand.
+
 ## Quick start
 
 Requires Python 3.11+.

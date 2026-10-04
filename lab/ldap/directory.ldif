@@ -1,0 +1,81 @@
+# People and groups in the lab directory. Every person's password is "ldap-password".
+#   alice  SDL-Admins     -> admin, every system
+#   bob    Web-Operators  -> operator, inventory group "web"
+#   carol  SDL-Auditors   -> auditor, every system
+#   dave   (no SDL group) -> cannot sign in to SDL
+dn: dc=lab,dc=example,dc=com
+objectClass: dcObject
+objectClass: organization
+dc: lab
+o: SDL lab
+
+dn: ou=people,dc=lab,dc=example,dc=com
+objectClass: organizationalUnit
+ou: people
+
+dn: ou=groups,dc=lab,dc=example,dc=com
+objectClass: organizationalUnit
+ou: groups
+
+dn: ou=services,dc=lab,dc=example,dc=com
+objectClass: organizationalUnit
+ou: services
+
+# The read-only account SDL searches the directory with.
+dn: cn=sdl-search,ou=services,dc=lab,dc=example,dc=com
+objectClass: person
+cn: sdl-search
+sn: search
+userPassword: search-password
+
+dn: uid=alice,ou=people,dc=lab,dc=example,dc=com
+objectClass: inetOrgPerson
+uid: alice
+cn: Alice Admin
+sn: Admin
+mail: alice@lab.example.com
+userPassword: ldap-password
+
+dn: uid=bob,ou=people,dc=lab,dc=example,dc=com
+objectClass: inetOrgPerson
+uid: bob
+cn: Bob Webb
+sn: Webb
+mail: bob@lab.example.com
+userPassword: ldap-password
+
+dn: uid=carol,ou=people,dc=lab,dc=example,dc=com
+objectClass: inetOrgPerson
+uid: carol
+cn: Carol Audit
+sn: Audit
+mail: carol@lab.example.com
+userPassword: ldap-password
+
+dn: uid=dave,ou=people,dc=lab,dc=example,dc=com
+objectClass: inetOrgPerson
+uid: dave
+cn: Dave Nogroup
+sn: Nogroup
+mail: dave@lab.example.com
+userPassword: ldap-password
+
+dn: cn=SDL-Admins,ou=groups,dc=lab,dc=example,dc=com
+objectClass: groupOfNames
+cn: SDL-Admins
+member: uid=alice,ou=people,dc=lab,dc=example,dc=com
+
+dn: cn=Web-Operators,ou=groups,dc=lab,dc=example,dc=com
+objectClass: groupOfNames
+cn: Web-Operators
+member: uid=bob,ou=people,dc=lab,dc=example,dc=com
+
+dn: cn=SDL-Auditors,ou=groups,dc=lab,dc=example,dc=com
+objectClass: groupOfNames
+cn: SDL-Auditors
+member: uid=carol,ou=people,dc=lab,dc=example,dc=com
+
+dn: cn=Unrelated,ou=groups,dc=lab,dc=example,dc=com
+objectClass: groupOfNames
+cn: Unrelated
+member: uid=dave,ou=people,dc=lab,dc=example,dc=com

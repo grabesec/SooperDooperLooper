@@ -1,0 +1,21 @@
+# Systems to import in the manual QA lab (docs/manual-qa.md, step 2.5):
+#   ./lab/lab.sh sdl systems import /dev/stdin --inventory inventory < lab/import-example.yaml
+# Their hosts do not exist, so a rollover on them fails at "connect" and changes nothing.
+systems:
+  - name: mail1
+    hostname: mail1
+    fqdn: mail1.lab.example.com
+    addresses: [10.99.0.21]
+    host: mail1-missing
+    secret_path: linux/mail1/root
+    service_account: {username: sdl-svc, credential_path: svc/sdl-svc}
+    groups: [mail, imported]
+    description: Imported from a file
+  - name: mail2
+    hostname: mail2
+    fqdn: mail2.lab.example.com
+    addresses: [10.99.0.22]
+    host: mail2-missing
+    secret_path: linux/mail2/root
+    service_account: {username: sdl-svc, credential_path: svc/sdl-svc}
+    groups: [mail, imported]
