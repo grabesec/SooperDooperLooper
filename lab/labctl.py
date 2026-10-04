@@ -535,6 +535,7 @@ def smoke() -> int:
 
 
 def main() -> int:
+    os.umask(0o077)  # lab keys, tokens and authenticator secrets: readable by SDL only
     args = sys.argv[1:]
     if args == ["serve"]:
         return serve()
