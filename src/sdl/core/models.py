@@ -216,6 +216,19 @@ class AuditFacets(BaseModel):
             self.actors.setdefault(event.initiated_by.id, 0)
 
 
+_FORBIDDEN_PATH_CHARS = set("?#%\\")
+
+
+def validate_secret_path(value: str) -> str:
+    """Reject secret paths that could escape their place in the secrets backend."""
+    if any(c in _FORBIDDEN_PATH_CHARS for c in value):
+        raise ValueError("secret path must not contain '?', '#', '%' or '\\'")
+    for segment in value.strip("/").split("/"):
+        if segment in ("", ".", ".."):
+            raise ValueError("secret path must not contain empty, '.' or '..' segments")
+    return value
+
+
 class ServiceAccount(BaseModel):
     """The account SDL signs in to a system with to perform the rollover.
 
@@ -233,6 +246,11 @@ class ServiceAccount(BaseModel):
     secrets: str | None = Field(
         default=None, description="Secrets module instance id; defaults to the only one configured."
     )
+
+    @field_validator("credential_path")
+    @classmethod
+    def _valid_credential_path(cls, value: str) -> str:
+        return validate_secret_path(value)
 
 
 class ServiceCredential(BaseModel):
@@ -279,6 +297,11 @@ class TargetSpec(BaseModel):
     source: str | None = Field(
         default=None, description="Inventory the system came from; set by SDL."
     )
+
+    @field_validator("secret_path")
+    @classmethod
+    def _valid_secret_path(cls, value: str) -> str:
+        return validate_secret_path(value)
 
     @field_validator("addresses")
     @classmethod

@@ -118,6 +118,7 @@ async def test_maps_virtual_machines_to_systems(monkeypatch: pytest.MonkeyPatch)
         monkeypatch,
         page_size=2,
         group_by=["tags", "site", "role"],
+        allow_custom_field_overrides=True,
         defaults={
             "secret_path": "linux/{site}/{name}/{account}",
             "service_account": {"username": "sdl-svc", "credential_path": "svc/{name}"},

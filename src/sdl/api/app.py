@@ -3,13 +3,15 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import hmac
 import logging
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
 from contextlib import asynccontextmanager, contextmanager
 from datetime import datetime
 from importlib.resources import files
 from typing import Annotated, Any, Literal
-from urllib.parse import parse_qs, quote, urlencode
+from urllib.parse import parse_qs, quote, urlencode, urlsplit
 
 from fastapi import Body, Depends, FastAPI, HTTPException, Query, Request, Response, status
 from fastapi.responses import RedirectResponse
@@ -239,6 +241,26 @@ def require(permission: str) -> Callable[[Request], Awaitable[Actor]]:
     return dependency
 
 
+SSO_STATE_COOKIE = "sdl_sso_state"
+
+
+def _scoped_sources(inventory: Any, actor: Actor) -> list[InventorySource]:
+    """Inventory sources as a caller limited to some systems may see them: no error text,
+    and only skipped names of systems they reach."""
+    if actor.access is None or actor.access.all_systems:
+        return list(inventory.sources)
+    names = {s.name for s in inventory.systems}
+    return [
+        src.model_copy(
+            update={
+                "skipped": [n for n in src.skipped if n in names],
+                "error": None if src.error is None else "unavailable",
+            }
+        )
+        for src in inventory.sources
+    ]
+
+
 def create_app(orchestrator: Orchestrator) -> FastAPI:
     orchestrator.load()
 
@@ -314,6 +336,11 @@ def create_app(orchestrator: Orchestrator) -> FastAPI:
         return Response(body, media_type=UI_FILES[name], headers=UI_HEADERS)
 
     identity = orchestrator.identity
+    if not orchestrator.settings.api.public_url and any(
+        p.login == "redirect" for p in identity.list_providers()
+    ):
+        # Without it, callback URLs (and the SAML audience) follow the Host header.
+        raise RuntimeError("single sign-on is configured: set api.public_url")
 
     # -- sign-in ------------------------------------------------------------------------
 
@@ -347,7 +374,31 @@ def create_app(orchestrator: Orchestrator) -> FastAPI:
         """Send the browser to the identity provider's sign-in page."""
         with http_errors():
             url = await identity.sso_begin(provider, _callback(request, provider), return_to)
-        return RedirectResponse(url, status_code=status.HTTP_303_SEE_OTHER)
+        response = RedirectResponse(url, status_code=status.HTTP_303_SEE_OTHER)
+        state = parse_qs(urlsplit(url).query).get("state", [""])[0]
+        if state:
+            # Bind the sign-in to this browser (login CSRF): the callback must come back
+            # with the same state.
+            response.set_cookie(
+                SSO_STATE_COOKIE,
+                _state_hash(state),
+                max_age=600,
+                path="/api/v1/auth/sso",
+                httponly=True,
+                samesite="lax",
+                secure=base_url(request).startswith("https://"),
+            )
+        return response
+
+    def _state_hash(state: str) -> str:
+        return hashlib.sha256(state.encode()).hexdigest()
+
+    def _sso_error(code: str) -> RedirectResponse:
+        response = RedirectResponse(
+            "/ui/#" + urlencode({"sso_error": code}), status_code=status.HTTP_303_SEE_OTHER
+        )
+        response.delete_cookie(SSO_STATE_COOKIE, path="/api/v1/auth/sso")
+        return response
 
     def _callback(request: Request, provider: str) -> str:
         return f"{base_url(request)}/api/v1/auth/sso/{quote(provider, safe='')}/callback"
@@ -367,20 +418,28 @@ def create_app(orchestrator: Orchestrator) -> FastAPI:
             params.update(
                 {k: v[0] for k, v in parse_qs(body.decode("utf-8", "replace")).items() if v}
             )
+        # SAML posts back cross-site, where a SameSite=Lax cookie is not sent; the state
+        # cookie is checked on the OIDC (``state``) flow.
+        if "state" in params:
+            cookie = request.cookies.get(SSO_STATE_COOKIE) or ""
+            if not hmac.compare_digest(cookie, _state_hash(params["state"])):
+                return _sso_error("state_mismatch")
         try:
             with http_errors():
                 code, return_to = await identity.sso_complete(
                     provider, params, _callback(request, provider), client_of(request)
                 )
         except HTTPException as exc:
-            message = exc.detail if isinstance(exc.detail, str) else "sign-in failed"
-            return RedirectResponse(
-                "/ui/#" + urlencode({"sso_error": message}), status_code=status.HTTP_303_SEE_OTHER
+            logging.getLogger("sdl.api").info(
+                "single sign-on with %s failed: %s", provider, exc.detail
             )
+            return _sso_error("unavailable" if exc.status_code >= 500 else "failed")
         key = "cli_code" if return_to == "cli" else "sso"
-        return RedirectResponse(
+        response = RedirectResponse(
             "/ui/#" + urlencode({key: code}), status_code=status.HTTP_303_SEE_OTHER
         )
+        response.delete_cookie(SSO_STATE_COOKIE, path="/api/v1/auth/sso")
+        return response
 
     @app.get("/api/v1/auth/sso/{provider}/metadata", tags=["auth"])
     async def sso_metadata(provider: str, request: Request) -> Response:
@@ -572,6 +631,7 @@ def create_app(orchestrator: Orchestrator) -> FastAPI:
         """Every system assigned to the caller, from every inventory, with each inventory's
         status."""
         inventory = await orchestrator.visible_inventory(actor)
+        inventory.sources = _scoped_sources(inventory, actor)
         inventory.systems = [s for s in inventory.systems if _matches(s, q, group, source)]
         return inventory
 
@@ -591,16 +651,17 @@ def create_app(orchestrator: Orchestrator) -> FastAPI:
 
     @app.get("/api/v1/inventory", tags=["inventory"])
     async def list_inventories(
-        _: Annotated[Actor, Depends(require(TARGETS_READ))],
+        actor: Annotated[Actor, Depends(require(TARGETS_READ))],
     ) -> list[InventorySource]:
-        return (await orchestrator.inventory()).sources
+        return _scoped_sources(await orchestrator.visible_inventory(actor), actor)
 
     @app.post("/api/v1/inventory/refresh", tags=["inventory"])
     async def refresh_inventory(
-        actor: Annotated[Actor, Depends(require(TARGETS_READ))],
+        actor: Annotated[Actor, Depends(require(INVENTORY_WRITE))],
     ) -> list[InventorySource]:
         """Drop cached inventory data (NetBox, ...) and read every source again."""
-        return (await orchestrator.refresh_inventory(actor)).sources
+        await orchestrator.refresh_inventory(actor)
+        return _scoped_sources(await orchestrator.visible_inventory(actor), actor)
 
     @app.put("/api/v1/inventory/{inventory_id}/systems/{name}", tags=["inventory"])
     async def put_system(

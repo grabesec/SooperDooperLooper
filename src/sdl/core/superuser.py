@@ -44,18 +44,7 @@ class Superuser(BaseModel):
     updated_at: datetime = Field(default_factory=utcnow)
 
 
-def check_permissions(path: Path) -> None:
-    """Raise when the file can be read or changed by anyone but its owner, or is owned by
-    someone other than SDL's system account (or root)."""
-    if sys.platform == "win32":  # pragma: no cover - POSIX permissions only
-        return
-    try:
-        info = path.stat()
-    except FileNotFoundError as exc:
-        raise SuperuserFileError(
-            f"superuser file {path} does not exist; create it with "
-            f"'sdl superuser set -f {path} --name <name>'"
-        ) from exc
+def _check_info(path: Path, info: os.stat_result) -> None:
     if not stat.S_ISREG(info.st_mode):
         raise SuperuserFileError(f"superuser file {path} is not a regular file")
     if info.st_mode & 0o077:
@@ -67,12 +56,45 @@ def check_permissions(path: Path) -> None:
         raise SuperuserFileError(f"superuser file {path} is owned by another user")
 
 
-def load(path: Path) -> Superuser:
-    check_permissions(path)
+def _missing(path: Path) -> SuperuserFileError:
+    return SuperuserFileError(
+        f"superuser file {path} does not exist; create it with "
+        f"'sdl superuser set -f {path} --name <name>'"
+    )
+
+
+def check_permissions(path: Path) -> None:
+    """Raise when the file can be read or changed by anyone but its owner, or is owned by
+    someone other than SDL's system account (or root)."""
+    if sys.platform == "win32":  # pragma: no cover - POSIX permissions only
+        return
     try:
-        return Superuser.model_validate(json.loads(path.read_text(encoding="utf-8")))
-    except (OSError, ValueError) as exc:
-        raise SuperuserFileError(f"cannot read superuser file {path}: {exc}") from exc
+        info = path.lstat()
+    except FileNotFoundError as exc:
+        raise _missing(path) from exc
+    _check_info(path, info)
+
+
+def load(path: Path) -> Superuser:
+    if sys.platform == "win32":  # pragma: no cover - POSIX permissions only
+        try:
+            return Superuser.model_validate(json.loads(path.read_text(encoding="utf-8")))
+        except (OSError, ValueError) as exc:
+            raise SuperuserFileError(f"cannot read superuser file {path}: {exc}") from exc
+    # Check and read the same open file, and never follow a symlink, so the file cannot be
+    # swapped between the check and the read.
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0))
+    except FileNotFoundError as exc:
+        raise _missing(path) from exc
+    except OSError as exc:
+        raise SuperuserFileError(f"cannot open superuser file {path}: {exc}") from exc
+    with os.fdopen(fd, "rb") as fh:
+        _check_info(path, os.fstat(fh.fileno()))
+        try:
+            return Superuser.model_validate(json.loads(fh.read().decode("utf-8")))
+        except (OSError, ValueError) as exc:
+            raise SuperuserFileError(f"cannot read superuser file {path}: {exc}") from exc
 
 
 def save(path: Path, superuser: Superuser) -> None:

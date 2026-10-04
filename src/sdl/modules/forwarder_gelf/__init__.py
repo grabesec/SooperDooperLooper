@@ -56,6 +56,9 @@ class GelfConfig(ForwarderConfig):
     client_cert: Path | None = None
     client_key: Path | None = None
     timeout: float = Field(default=10, gt=0)
+    allow_insecure: bool = Field(
+        default=False, description="Allow sending auth_header over plain http://."
+    )
 
     @model_validator(mode="after")
     def _check(self) -> GelfConfig:
@@ -65,6 +68,16 @@ class GelfConfig(ForwarderConfig):
             raise ValueError(f"host is required for transport: {self.transport}")
         if bool(self.auth_header) != bool(self.auth_value_env):
             raise ValueError("auth_header and auth_value_env go together")
+        if (
+            self.auth_header
+            and self.url
+            and self.url.lower().startswith("http://")
+            and not self.allow_insecure
+        ):
+            raise ValueError(
+                "url is http:// and would send auth_header in clear text; "
+                "use https:// or set allow_insecure: true"
+            )
         return self
 
 

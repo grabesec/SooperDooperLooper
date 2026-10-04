@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib
+import os
 from importlib.metadata import entry_points
 
 from sdl.core.module import Module
@@ -19,7 +20,8 @@ class ModuleRegistry:
 
     Types come from the ``sdl.modules`` entry-point group. A type can also be
     given as ``package.module:ClassName``, which is handy while developing a
-    module that is not packaged yet.
+    module that is not packaged yet; that form imports arbitrary code, so it is
+    only allowed when ``SDL_ALLOW_CUSTOM_MODULES=1`` is set.
     """
 
     def __init__(self) -> None:
@@ -42,6 +44,11 @@ class ModuleRegistry:
         if type_name in self._types:
             return self._types[type_name]
         if ":" in type_name:
+            if os.environ.get("SDL_ALLOW_CUSTOM_MODULES") != "1":
+                raise UnknownModuleError(
+                    f"module type {type_name!r} uses the module:Class form, which needs "
+                    "SDL_ALLOW_CUSTOM_MODULES=1"
+                )
             module_path, _, attr = type_name.partition(":")
             return _check(type_name, getattr(importlib.import_module(module_path), attr))
         known = ", ".join(self._types) or "none"

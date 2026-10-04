@@ -54,12 +54,17 @@ class StoreUsersModule(UserStoreModule):
     def _check_permissions(self) -> None:
         if sys.platform == "win32":  # pragma: no cover - POSIX permissions only
             return
-        mode = stat.S_IMODE(self.config.path.stat().st_mode)
+        info = self.config.path.lstat()
+        if not stat.S_ISREG(info.st_mode):
+            raise ModuleError(f"user file {self.config.path} is not a regular file")
+        mode = stat.S_IMODE(info.st_mode)
         if mode & 0o077:
             raise ModuleError(
                 f"user file {self.config.path} is accessible to other users (mode {mode:o}); "
                 f"run 'chmod 600 {self.config.path}'"
             )
+        if info.st_uid not in (os.geteuid(), 0):
+            raise ModuleError(f"user file {self.config.path} is owned by another user")
 
     def _load(self) -> dict[str, UserRecord]:
         try:

@@ -10,6 +10,7 @@ log concentrator can index it and still check it against the hash chain.
 from __future__ import annotations
 
 import os
+import re
 import socket
 from pathlib import Path
 from typing import Any, Literal
@@ -75,6 +76,14 @@ def _printable(text: str, limit: int) -> str:
     return cleaned[:limit] or "-"
 
 
+_CONTROL = re.compile("[\x00-\x1f\x7f-\x9f\u2028\u2029]")
+
+
+def _clean(text: str) -> str:
+    """Drop control characters and line separators so one event stays one line."""
+    return _CONTROL.sub(" ", text)
+
+
 def _param(value: str) -> str:
     return value.replace("\\", "\\\\").replace('"', '\\"').replace("]", "\\]")
 
@@ -122,11 +131,11 @@ class SyslogForwarderModule(ForwarderModule):
             f"<{pri}>1 {ts} {self.hostname} {_printable(c.app_name, 48)} {os.getpid()} "
             f"{_printable(event.action, 32)} [{c.sd_id} {params}] "
         )
-        body = event.model_dump_json() if c.body == "json" else summary(event)
+        body = event.model_dump_json() if c.body == "json" else _clean(summary(event))
         message = (header + body).encode()
         if c.protocol == "udp" and len(message) > c.max_udp_size:
             # Too big for one datagram: send the summary rather than cut the JSON in half.
-            message = (header + summary(event)).encode()[: c.max_udp_size]
+            message = (header + _clean(summary(event))).encode()[: c.max_udp_size]
         return message
 
     def frame(self, message: bytes) -> bytes:

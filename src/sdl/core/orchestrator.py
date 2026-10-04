@@ -70,6 +70,7 @@ class Orchestrator:
         self.runs: dict[str, RolloverRun] = {}
         self._tasks: dict[str, asyncio.Task[None]] = {}
         self._busy_targets: set[str] = set()
+        self._busy_specs: dict[str, TargetSpec] = {}
         self._inventory_down: dict[str, str] = {}
         self._started = False
         self._identity: Identity | None = None
@@ -373,6 +374,32 @@ class Orchestrator:
             return None
         return run.model_copy(update={"results": results})
 
+    def _path_clashes(self, systems: list[TargetSpec]) -> list[str]:
+        """Find systems whose secret paths collide with another system's paths."""
+        suffix = self.settings.rollover.staging_suffix
+        owners: dict[str, str] = {}
+        problems: list[str] = []
+        for s in systems:
+            if s.secret_path in owners and owners[s.secret_path] != s.name:
+                problems.append(
+                    f"system {s.name!r} has the same secret_path as {owners[s.secret_path]!r}"
+                )
+            owners.setdefault(s.secret_path, s.name)
+        for s in systems:
+            if s.service_account is None:
+                continue
+            path = s.service_account.credential_path
+            for other in systems:
+                if other.name != s.name and path in (
+                    other.secret_path,
+                    f"{other.secret_path}/{suffix}",
+                ):
+                    problems.append(
+                        f"system {s.name!r} service account credential_path is the "
+                        f"secret_path of {other.name!r}"
+                    )
+        return problems
+
     async def put_system(self, inventory_id: str, system: TargetSpec, actor: Actor) -> TargetSpec:
         """Add or replace a system in a writable inventory, after checking it is usable."""
         module = self.inventory_module(inventory_id)
@@ -389,7 +416,14 @@ class Orchestrator:
         current = await self.inventory()
         existing = [s for s in current.systems if s.name == system.name]
         if existing and not actor.permits(existing[0]):
-            raise ConflictError(f"a system named {system.name!r} already exists")
+            raise ForbiddenError(
+                f"system {system.name!r} would be outside the groups and systems assigned to you"
+            )
+        clashes = self._path_clashes(
+            [system, *(s for s in current.systems if s.name != system.name)]
+        )
+        if clashes:
+            raise RequestError("; ".join(clashes))
         elsewhere = [s.source for s in existing]
         if elsewhere and elsewhere[0] != inventory_id:
             raise ConflictError(
@@ -510,7 +544,21 @@ class Orchestrator:
 
     async def start_rollover(self, request: RolloverRequest, actor: Actor) -> RolloverRun:
         targets = await self.select_targets(request, actor)
-        busy = [t.name for t in targets if t.name in self._busy_targets]
+        clashes = self._path_clashes((await self.inventory()).systems)
+        clashes = [c for c in clashes if any(repr(t.name) in c for t in targets)]
+        if clashes:
+            raise RequestError("cannot roll over: " + "; ".join(clashes))
+        running = [spec for name, spec in self._busy_specs.items() if name in self._busy_targets]
+        busy = [
+            t.name
+            for t in targets
+            if t.name in self._busy_targets
+            or any(
+                t.secret_path == r.secret_path
+                or (t.host, t.port, t.account) == (r.host, r.port, r.account)
+                for r in running
+            )
+        ]
         if busy:
             raise ConflictError(f"rollover already in progress for: {', '.join(busy)}")
         run = RolloverRun(
@@ -529,6 +577,7 @@ class Orchestrator:
             ],
         )
         self._busy_targets.update(t.name for t in targets)
+        self._busy_specs.update((t.name, t) for t in targets)
         self.runs[run.id] = run
         self._run_systems[run.id] = {t.name: list(t.groups) for t in targets}
         try:

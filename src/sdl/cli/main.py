@@ -13,6 +13,7 @@ from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote as _quote
+from urllib.parse import urlsplit
 
 import httpx
 
@@ -196,12 +197,32 @@ def saved_session(url: str) -> str | None:
 def save_session(url: str, token: str, user: str) -> None:
     path = session_file()
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    os.chmod(path.parent, 0o700)
     fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    os.fchmod(fd, 0o600)
     with os.fdopen(fd, "w", encoding="utf-8") as fh:
         json.dump({"url": url.rstrip("/"), "token": token, "user": user}, fh)
 
 
+_warned_insecure = False
+
+
+def _warn_insecure(url: str) -> None:
+    global _warned_insecure
+    parsed = urlsplit(url)
+    if _warned_insecure or parsed.scheme != "http":
+        return
+    if (parsed.hostname or "") in ("localhost", "127.0.0.1", "::1"):
+        return
+    _warned_insecure = True
+    print(
+        f"warning: {url} is plain http://; tokens and passwords are sent unencrypted",
+        file=sys.stderr,
+    )
+
+
 def client(args: argparse.Namespace) -> httpx.Client:
+    _warn_insecure(args.url)
     token = os.environ.get("SDL_TOKEN") or saved_session(args.url)
     if not token:
         raise CliError("sign in with 'sdl login', or set SDL_TOKEN to an API token")
@@ -211,6 +232,7 @@ def client(args: argparse.Namespace) -> httpx.Client:
 
 
 def anonymous(args: argparse.Namespace) -> httpx.Client:
+    _warn_insecure(args.url)
     return httpx.Client(base_url=args.url, timeout=args.http_timeout)
 
 

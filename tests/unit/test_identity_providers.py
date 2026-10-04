@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import datetime as dt
+import hashlib
 import json
 import time
 from collections.abc import Iterator
@@ -32,6 +33,13 @@ CLIENT_ID = "sdl-client"
 SP_ENTITY = "https://sdl.example.com/saml"
 IDP_ENTITY = "https://idp.example.com/saml"
 BASE = "http://testserver"
+
+
+@pytest.fixture(autouse=True)
+def _sso_log(caplog: pytest.LogCaptureFixture) -> None:
+    global _caplog
+    caplog.set_level("INFO", "sdl.api")
+    _caplog = caplog
 
 
 def bearer(token: str) -> dict[str, str]:
@@ -194,6 +202,7 @@ def idp_api(orchestrator_factory: Any, tmp_path: Path) -> Iterator[tuple[TestCli
     import os
 
     os.environ["SDL_TEST_OIDC_SECRET"] = "client-secret"
+    orchestrator.settings.api.public_url = "http://testserver"
     with TestClient(create_app(orchestrator)) as client:
         oidc = orchestrator.modules["entra"]
         oidc._transport = httpx.MockTransport(signer.handler)
@@ -374,7 +383,7 @@ def test_oidc_single_sign_on(idp_api: tuple[TestClient, Any]) -> None:
         params={"code": "good-code", "state": params["state"]},
         follow_redirects=False,
     )
-    assert "expired" in fragment(replay)["sso_error"]
+    assert fragment(replay)["sso_error"] in ("failed", "state_mismatch")
 
 
 @pytest.mark.parametrize(
@@ -400,7 +409,7 @@ def test_oidc_refuses_bad_tokens(
         params={"code": "good-code", "state": params["state"]},
         follow_redirects=False,
     )
-    assert error in fragment(back)["sso_error"]
+    assert fragment(back)["sso_error"] == "failed" and error in _caplog.text
 
 
 def test_oidc_refuses_unsigned_or_foreign_tokens(idp_api: tuple[TestClient, Any]) -> None:
@@ -582,7 +591,7 @@ def test_saml_refuses_bad_responses(
     if change.get("key") == "other":
         change["key"] = rsa.generate_private_key(public_exponent=65537, key_size=2048)
     back = saml_post(api, params["RelayState"], saml.response(request_id, **change))
-    assert error in fragment(back)["sso_error"]
+    assert fragment(back)["sso_error"] == "failed" and error in _caplog.text
 
 
 def test_saml_signature_wrapping_reads_only_the_signed_assertion(
@@ -603,11 +612,13 @@ def test_sso_errors_and_audit(idp_api: tuple[TestClient, Any]) -> None:
     assert unknown.status_code == 404
     password_only = api.get("/api/v1/auth/sso/ad/start", follow_redirects=False)
     assert password_only.status_code == 404
+    # A matching state cookie, so the forged state reaches the provider check.
+    api.cookies.set("sdl_sso_state", hashlib.sha256(b"made-up").hexdigest())
     forged = api.get(
         "/api/v1/auth/sso/entra/callback", params={"code": "x", "state": "made-up"},
         follow_redirects=False,
     )  # fmt: skip
-    assert "expired" in fragment(forged)["sso_error"]
+    assert fragment(forged)["sso_error"] in ("failed", "state_mismatch")
     events = api.get(
         "/api/v1/audit", params={"action": "auth.login"}, headers=bearer(ADMIN_TOKEN)
     ).json()

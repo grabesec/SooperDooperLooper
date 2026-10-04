@@ -173,7 +173,10 @@ class FlakyInventory(InventoryModule):
             raise ModuleError("CMDB refused the refresh")
 
 
-async def test_inventory_outages_are_recorded_once_each(orchestrator_factory: Any) -> None:
+async def test_inventory_outages_are_recorded_once_each(
+    orchestrator_factory: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("SDL_ALLOW_CUSTOM_MODULES", "1")
     orchestrator: Orchestrator = orchestrator_factory(
         extra_modules={"cmdb": {"type": "tests.unit.test_logs:FlakyInventory"}}
     )

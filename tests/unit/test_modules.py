@@ -115,7 +115,7 @@ async def test_recorder_fails_closed_without_audit_modules() -> None:
         await AuditRecorder().record("x", Outcome.INFO)
 
 
-def test_registry_finds_builtin_modules() -> None:
+def test_registry_finds_builtin_modules(monkeypatch: pytest.MonkeyPatch) -> None:
     available = ModuleRegistry.from_entry_points().available()
     assert {
         "audit.jsonl",
@@ -126,6 +126,7 @@ def test_registry_finds_builtin_modules() -> None:
     } <= set(available)
     with pytest.raises(UnknownModuleError):
         ModuleRegistry.from_entry_points().resolve("target.nope")
+    monkeypatch.setenv("SDL_ALLOW_CUSTOM_MODULES", "1")
     assert ModuleRegistry().resolve("sdl.modules.audit_jsonl:JsonlAuditModule") is JsonlAuditModule
 
 

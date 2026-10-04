@@ -274,6 +274,13 @@ def test_lockout_after_failed_sign_ins(api: TestClient) -> None:
     assert [e["outcome"] for e in events] == ["failure"] * 3 + ["denied", "success"]
 
 
+def test_superuser_lockout_after_failed_sign_ins(api: TestClient) -> None:
+    for _ in range(3):
+        assert login(api, "root-admin", "wrong-password-x").status_code == 401
+    locked = login(api, "root-admin", SU_PASSWORD)
+    assert locked.status_code == 401 and "too many" in locked.json()["detail"]
+
+
 def test_unknown_users_and_wrong_passwords_look_the_same(api: TestClient) -> None:
     su = su_token(api)
     add_user(api, su, "dave")
@@ -400,7 +407,7 @@ def test_restricted_users_cannot_widen_their_reach(api: TestClient) -> None:
     url = "/api/v1/inventory/inventory/systems"
     db = {"name": "db9", "host": "db9.test", "secret_path": "x", "groups": ["db"]}
     assert api.put(f"{url}/db9", json=db, headers=bearer(token)).status_code == 403
-    web = {**db, "name": "web9", "groups": ["web"]}
+    web = {**db, "name": "web9", "secret_path": "web9", "groups": ["web"]}
     assert api.put(f"{url}/web9", json=web, headers=bearer(token)).status_code == 200
     assert api.put(f"{url}/db9", json=db, headers=bearer(su)).status_code == 200
     assert api.delete(f"{url}/db9", headers=bearer(token)).status_code == 404
