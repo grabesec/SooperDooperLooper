@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import getpass
 import json
 import os
@@ -292,10 +293,8 @@ def _message(detail: Any) -> str:
 def cmd_logout(args: argparse.Namespace) -> int:
     if saved_session(args.url):
         with client(args) as http:
-            try:
+            with contextlib.suppress(CliError):  # already ended on the server
                 call(http, "POST", "/api/v1/auth/logout")
-            except CliError:
-                pass  # already ended on the server
     session_file().unlink(missing_ok=True)
     print("Signed out.")
     return 0

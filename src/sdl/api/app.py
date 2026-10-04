@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import hashlib
 import hmac
 import logging
@@ -702,10 +703,9 @@ def create_app(orchestrator: Orchestrator) -> FastAPI:
         with http_errors():
             run = await orchestrator.start_rollover(body, actor)
         if wait:
-            try:
+            # On timeout the run is still going; the caller polls GET /rollovers/{id}.
+            with contextlib.suppress(TimeoutError):
                 run = await orchestrator.wait(run.id, timeout)
-            except TimeoutError:
-                pass  # still running; the caller polls GET /rollovers/{id}
         return orchestrator.visible_run(run, actor) or run
 
     @app.get("/api/v1/rollovers", tags=["rollovers"])

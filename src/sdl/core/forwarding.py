@@ -11,6 +11,7 @@ forwarder going down and coming back is itself recorded in the audit log.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import itertools
 import logging
 import ssl
@@ -168,10 +169,8 @@ class Forwarding:
             if channel.task is None:
                 return
             if channel.ok and channel.queue:
-                try:
+                with contextlib.suppress(TimeoutError):
                     await asyncio.wait_for(channel.idle.wait(), channel.config.flush_timeout)
-                except TimeoutError:
-                    pass
             if channel.queue:
                 log.warning(
                     "forwarder %s: %d event(s) not delivered at shutdown (still in the local log)",
@@ -285,10 +284,8 @@ class StreamConnection:
         writer, self._writer = self._writer, None
         if writer is not None:
             writer.close()
-            try:
+            with contextlib.suppress(OSError, TimeoutError, ssl.SSLError):
                 await asyncio.wait_for(writer.wait_closed(), self.timeout)
-            except (OSError, TimeoutError, ssl.SSLError):
-                pass
 
 
 class DatagramSender:
